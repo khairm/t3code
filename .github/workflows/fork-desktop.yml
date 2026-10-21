@@ -1,0 +1,198 @@
+name: Fork desktop
+
+# Builds the Windows arm64 app for one fork commit and attaches it to a draft
+# release. Drafts have no tag, so the PC's updater can't see them. The server
+# publishes the draft, which creates the tag, once it runs that version.
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: Full fork commit sha to build
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: fork-desktop-${{ inputs.sha }}
+
+jobs:
+  # A copy of release.yml's build_bundle: the JS bundle every packaging job
+  # downloads as `js-bundle`, stamped with .fork/version.txt.
+  bundle:
+    name: Build JS bundle
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    outputs:
+      version: ${{ steps.config.outputs.version }}
+      clerk_publishable_key: ${{ steps.config.outputs.clerk_publishable_key }}
+      clerk_jwt_template: ${{ steps.config.outputs.clerk_jwt_template }}
+      clerk_cli_oauth_client_id: ${{ steps.config.outputs.clerk_cli_oauth_client_id }}
+      relay_url: ${{ steps.config.outputs.relay_url }}
+    steps:
+      - name: Check sha
+        env:
+          SHA: ${{ inputs.sha }}
+        run: '[[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "sha must be a full commit sha" >&2; exit 1; }'
+
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.sha }}
+          sparse-checkout: |
+            /*
+            !/.repos/
+          sparse-checkout-cone-mode: false
+
+      # The public Clerk and relay identifiers come from upstream's .env.example,
+      # the same values official builds carry.
+      - id: config
+        name: Resolve version and public config
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(tr -d '[:space:]' < .fork/version.txt)"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-nightly\.[0-9]{8}\.[0-9]+$ ]]; then
+            echo ".fork/version.txt is not a nightly version: $version" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          for name in CLERK_PUBLISHABLE_KEY CLERK_JWT_TEMPLATE CLERK_CLI_OAUTH_CLIENT_ID RELAY_URL; do
+            value="$(sed -n "s/^T3CODE_${name}=//p" .env.example)"
+            if [[ -z "$value" ]]; then
+              echo ".env.example has no T3CODE_${name}" >&2
+              exit 1
+            fi
+            echo "${name,,}=$value" >> "$GITHUB_OUTPUT"
+            echo "T3CODE_${name}=$value" >> "$GITHUB_ENV"
+          done
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: false
+
+      - name: Install bundle dependencies
+        run: vp install --filter=t3... --filter=@t3tools/web... --filter=@t3tools/desktop... --filter=@t3tools/scripts...
+
+      - name: Align package versions to release version
+        run: node scripts/update-release-package-versions.ts "${{ steps.config.outputs.version }}"
+
+      - uses: ./.github/actions/setup-apt-mirrors
+
+      - name: Install browser secret helper build libraries
+        run: sudo apt-get update && sudo apt-get install -y libsecret-1-dev pkg-config
+
+      - name: Build JS bundle
+        env:
+          T3CODE_TELEMETRY_CHANNEL: dev
+        run: vp run build:desktop
+
+      - name: Upload JS bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: js-bundle
+          path: |
+            apps/server/dist
+            apps/desktop/dist-electron
+          if-no-files-found: error
+          retention-days: 1
+
+  # The Windows job embeds this job's `cli-linux-arm64` archive as its WSL
+  # runtime and waits for a job named "Build Linux arm64".
+  linux_arm64:
+    name: Desktop Linux arm64
+    needs: [bundle]
+    uses: ./.github/workflows/release-desktop.yml
+    with:
+      version: ${{ needs.bundle.outputs.version }}
+      ref: ${{ inputs.sha }}
+      release_channel: nightly
+      relay_client_tracing: false
+      clerk_publishable_key: ${{ needs.bundle.outputs.clerk_publishable_key }}
+      clerk_jwt_template: ${{ needs.bundle.outputs.clerk_jwt_template }}
+      clerk_cli_oauth_client_id: ${{ needs.bundle.outputs.clerk_cli_oauth_client_id }}
+      relay_url: ${{ needs.bundle.outputs.relay_url }}
+      label: Linux arm64
+      runner: ubuntu-24.04-arm
+      platform: linux
+      target: AppImage
+      arch: arm64
+      rust_target: aarch64-unknown-linux-gnu
+      resource_key: linux-arm64
+      cli_archive: true
+
+  windows_arm64:
+    name: Desktop Windows arm64
+    needs: [bundle]
+    uses: ./.github/workflows/release-desktop.yml
+    with:
+      version: ${{ needs.bundle.outputs.version }}
+      ref: ${{ inputs.sha }}
+      release_channel: nightly
+      relay_client_tracing: false
+      clerk_publishable_key: ${{ needs.bundle.outputs.clerk_publishable_key }}
+      clerk_jwt_template: ${{ needs.bundle.outputs.clerk_jwt_template }}
+      clerk_cli_oauth_client_id: ${{ needs.bundle.outputs.clerk_cli_oauth_client_id }}
+      relay_url: ${{ needs.bundle.outputs.relay_url }}
+      label: Windows arm64
+      runner: windows-11-arm
+      platform: win
+      target: nsis
+      arch: arm64
+      rust_target: aarch64-pc-windows-msvc
+      resource_key: win32-arm64
+      cli_archive: false
+
+  draft:
+    name: Draft release
+    needs: [bundle, windows_arm64]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: v${{ needs.bundle.outputs.version }}
+      SHA: ${{ inputs.sha }}
+    steps:
+      - name: Download Windows arm64 build
+        uses: actions/download-artifact@v8
+        with:
+          name: desktop-win-arm64
+          path: assets
+
+      # electron-updater reads nightly.yml; with one arch there is nothing to merge.
+      - name: Create draft release
+        shell: bash
+        working-directory: assets
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          mv nightly-win-arm64.yml nightly.yml
+          exes=(*.exe)
+          maps=(*.exe.blockmap)
+          if (( ${#exes[@]} != 1 || ${#maps[@]} != 1 )); then
+            echo "Expected one exe and one blockmap, found: $(ls)" >&2
+            exit 1
+          fi
+          grep -qF "${exes[0]}" nightly.yml
+
+          releases="$(gh api --paginate "repos/$GH_REPO/releases" --jq ".[] | select(.tag_name == \"$TAG\") | \"\(.id) \(.draft)\"")"
+          if grep -q ' false$' <<<"$releases"; then
+            echo "$TAG is already published" >&2
+            exit 1
+          fi
+          for id in $(cut -d' ' -f1 <<<"$releases"); do
+            gh api -X DELETE "repos/$GH_REPO/releases/$id"
+          done
+
+          gh release create "$TAG" --draft --prerelease --target "$SHA" \
+            --title "T3 Code (Nightly) ${TAG#v}" --notes "Fork build of $SHA." \
+            "${exes[0]}" "${maps[0]}" nightly.yml

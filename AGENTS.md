@@ -1,3 +1,15 @@
+# Fork: khairm/t3code
+
+Fork of pingdotgg/t3code for the owner's NixOS server and Windows ARM64 PC. Upstream's guide is below the line.
+
+- Flow: the server's `t3-fork-sync` (khairm/Self-Hosted) merges each new upstream nightly into `candidate/<ver>`, gates and builds it, dispatches `fork-desktop.yml` for a draft release, then fast-forwards `main`. Self-Hosted pins `main`'s commit. The server publishes the draft, which creates tag `v<ver>`, only once it runs that version, so the PC never runs ahead of it.
+- Allowed files: `git diff --name-only refs/upstream-tags/<base> HEAD` may list only `.fork/*`, `AGENTS.md`, `.github/workflows/fork-desktop.yml`, deleted upstream workflows (all but `release-desktop.yml`) and the files in `.fork/features.txt`. Everything else equals upstream, so the official phone app keeps working.
+- Features: each `.fork/features.txt` line is `<marker> <file>`. The marker must survive every merge. Adding a feature is a reviewed PR that adds its line.
+- Version: `.fork/version.txt` is `<upstream base>-nightly.<date>.<run×100+k>`, k=00 for an upstream merge and 01-99 for fork-only rebuilds. It rises with every release. `.fork/upstream-baseline.txt` names the merged upstream tag.
+- Humans branch, then PR into `main`. Never push upstream tags here. The server publishes drafts.
+
+---
+
 # T3 Code
 
 T3 Code is a minimal GUI for coding agents. A Node WebSocket server wraps provider CLIs and agents (Codex, Claude Code, Cursor, Grok, OpenCode, Antigravity) and serves web, desktop, and mobile clients.

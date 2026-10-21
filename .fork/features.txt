@@ -1,0 +1,2 @@
+# <marker> <file>. The marker must stay in its file, and only these files may differ from upstream.
+T3_CLAUDE_SHARED_CONTINUATION apps/server/src/provider/Drivers/ClaudeHome.ts
