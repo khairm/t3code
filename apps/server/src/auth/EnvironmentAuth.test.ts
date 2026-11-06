@@ -10,6 +10,7 @@ import {
 } from "@t3tools/shared/dpop";
 import { expect, it } from "@effect/vitest";
 import * as DateTime from "effect/DateTime";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Redacted from "effect/Redacted";
@@ -436,6 +437,82 @@ it.layer(NodeServices.layer)("EnvironmentAuth.layer", (it) => {
       expect(session.scopes).toEqual(["orchestration:read"]);
     }).pipe(
       Effect.provide(layerEnvironmentAuth({ desktopBootstrapToken: "desktop-bootstrap-token" })),
+    ),
+  );
+
+  // fork:paired-session-ttl
+  it.effect("gives only bearer pairings of one-time codes a 10-year session", () =>
+    Effect.gen(function* () {
+      const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
+      const code = (
+        input?: Parameters<EnvironmentAuth.EnvironmentAuth["Service"]["createPairingLink"]>[0],
+      ) => serverAuth.createPairingLink(input).pipe(Effect.map((link) => link.credential));
+      const exchange = (credential: string, label: string, proofKeyThumbprint?: string) =>
+        serverAuth.exchangeBootstrapCredentialForAccessToken(
+          credential,
+          undefined,
+          { ...requestMetadata, label },
+          proofKeyThumbprint ? { proofKeyThumbprint } : undefined,
+        );
+
+      yield* exchange(yield* code(), "paired");
+      yield* exchange(yield* code(), "paired with DPoP", "proof-key");
+      yield* exchange(
+        yield* code({ subject: "cloud-connect", proofKeyThumbprint: "proof-key" }),
+        "connect",
+        "proof-key",
+      );
+      yield* exchange(
+        yield* code({
+          subject: EnvironmentAuth.INTERNAL_ADMINISTRATIVE_BOOTSTRAP_SUBJECT,
+          purpose: "startup",
+        }),
+        "startup",
+      );
+      yield* exchange("desktop-bootstrap-token", "desktop bootstrap");
+      yield* exchange("reusable-dev-auth-token-that-is-long-enough", "reusable dev");
+      yield* serverAuth.createBrowserSession(yield* code(), {
+        ...requestMetadata,
+        label: "browser",
+      });
+      yield* serverAuth.issueMcpClientSession({
+        label: "peer link",
+        access: "read-only",
+        peerLink: true,
+        client: requestMetadata,
+      });
+      yield* serverAuth.issueSession({
+        label: "cli",
+        subject: "one-time-token",
+        ttl: Duration.days(2),
+      });
+
+      const lifetimeHours = Object.fromEntries(
+        (yield* serverAuth.listSessions()).map((session) => [
+          session.client.label,
+          (session.expiresAt.epochMilliseconds - session.issuedAt.epochMilliseconds) / 3_600_000,
+        ]),
+      );
+      expect(lifetimeHours).toMatchObject({
+        paired: 10 * 365 * 24,
+        "paired with DPoP": 1,
+        connect: 1,
+        startup: 30 * 24,
+        "desktop bootstrap": 30 * 24,
+        "reusable dev": 30 * 24,
+        browser: 30 * 24,
+        "peer link": 30 * 24,
+        cli: 2 * 24,
+      });
+    }).pipe(
+      Effect.provide(
+        layerEnvironmentAuth({
+          mode: "web",
+          devUrl: new URL("http://127.0.0.1:5173"),
+          devAuthToken: Redacted.make("reusable-dev-auth-token-that-is-long-enough"),
+          desktopBootstrapToken: "desktop-bootstrap-token",
+        }),
+      ),
     ),
   );
 

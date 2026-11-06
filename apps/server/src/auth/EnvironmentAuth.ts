@@ -962,12 +962,16 @@ export const make = Effect.gen(function* () {
                 method: input?.proofKeyThumbprint ? "dpop-access-token" : "bearer-access-token",
                 subject: grant.subject,
                 scopes: grantedScopes,
+                // fork:paired-session-ttl: devices can only redeem a one-time code, so a direct
+                // pairing lasts 10 years instead of lapsing after the default 30 days.
                 ...(input?.proofKeyThumbprint
                   ? {
                       proofKeyThumbprint: input.proofKeyThumbprint,
                       ttl: Duration.hours(1),
                     }
-                  : {}),
+                  : grant.method === "one-time-token" && grant.subject === "one-time-token"
+                    ? { ttl: Duration.days(10 * 365) }
+                    : {}),
                 replaceActiveForSubjectAndMethod: grant.method === "desktop-bootstrap",
                 client: {
                   ...requestMetadata,
