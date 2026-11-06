@@ -1,1 +1,3 @@
 # <marker> <file>. The marker must stay in its file, and only these files may differ from upstream.
+fork:paired-session-ttl apps/server/src/auth/EnvironmentAuth.ts
+fork:paired-session-ttl apps/server/src/auth/EnvironmentAuth.test.ts
