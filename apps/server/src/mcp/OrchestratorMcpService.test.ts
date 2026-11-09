@@ -27,7 +27,9 @@ import {
 import { checkpointWorkspace } from "@t3tools/provider-testing/replayWorkspace";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
+import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Queue from "effect/Queue";
@@ -1746,6 +1748,56 @@ describe("OrchestratorMcpService provider resolution", () => {
           );
         }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(layerDependencies))));
       }).pipe(withProductionAllowlist),
+  );
+
+  // fork:model-allowlist
+  it.effect("checks a delegate model by the allowlist alone while the provider list loads", () =>
+    Effect.gen(function* () {
+      const layerDependencies = Layer.mergeAll(
+        NodeServices.layer,
+        Layer.mock(ThreadManagementService.ThreadManagementService)({
+          hasReceipt: () => Effect.succeed(false),
+          assertProviderInstanceEnabled: () => Effect.void,
+          getThreadRecords: () =>
+            Effect.succeed(
+              parentProjection([], { instanceId: codexInstanceId, model: "gpt-6.1-sol" }),
+            ),
+        }),
+        ServerSettings.layerTest(),
+        providerRegistryLayer([
+          {
+            ...providerSnapshot({
+              instanceId: codexInstanceId,
+              driver: ProviderDriverKind.make("codex"),
+            }),
+            models: [],
+          },
+        ]),
+        adapterRegistryLayer([codexInstanceId]),
+        Layer.mock(ProjectService.ProjectService)({}),
+        Layer.mock(SecretRequests.SecretRequests)({}),
+        Layer.mock(RemoteDelegation.RemoteDelegation)({}),
+        Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+      );
+
+      yield* Effect.gen(function* () {
+        const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+        const delegate = (model: string) =>
+          Effect.gen(function* () {
+            return yield* service.delegateTask(scope, {
+              task: "Review the change.",
+              target: yield* decodeTarget({ providerInstanceId: codexInstanceId, model }),
+              mode: "async",
+            });
+          }).pipe(Effect.exit);
+        const blocked = yield* delegate("gpt-6-luna");
+        assert.include(Exit.isFailure(blocked) ? Cause.pretty(blocked.cause) : "", "not allowed");
+        const allowed = yield* delegate("gpt-6.1-sol");
+        const allowedFailure = Exit.isFailure(allowed) ? Cause.pretty(allowed.cause) : "";
+        assert.notInclude(allowedFailure, "not advertised");
+        assert.notInclude(allowedFailure, "not allowed");
+      }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(layerDependencies))));
+    }).pipe(withProductionAllowlist),
   );
 
   it.effect("driver-only delegation skips an instance the project turned off", () =>

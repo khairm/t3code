@@ -2,7 +2,8 @@
 import * as Effect from "effect/Effect";
 import { vi } from "vite-plus/test";
 
-import { ALLOWED_MODELS_ENV, overrideAllowedModelsForTests } from "./allowedModels.ts";
+import { ALLOWED_MODELS_ENV } from "./allowedModels.ts";
+import { overrideAllowedModelsForTests } from "./allowedModelsTestOverride.ts";
 
 const PRODUCTION_ALLOWED_MODELS =
   "claude-fable-5-1,claude-opus-5-5,claude-mythos-5-1,gpt-6-astra,gpt-6.1-sol";

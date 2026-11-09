@@ -64,6 +64,20 @@ function provider(input: {
   };
 }
 
+// fork:model-allowlist: the server lists each custom model it allows; the picker shows only those.
+function withServerCustomModels(
+  base: ServerProvider,
+  slugs: ReadonlyArray<string>,
+): ServerProvider {
+  return {
+    ...base,
+    models: [
+      ...base.models,
+      ...slugs.map((slug) => ({ slug, name: slug, isCustom: true, capabilities: {} })),
+    ],
+  };
+}
+
 function settingsWithProviderInstances(): UnifiedSettings {
   return {
     ...DEFAULT_UNIFIED_SETTINGS,
@@ -223,10 +237,13 @@ describe("instance-scoped model selection", () => {
         instanceId: "claudeAgent",
         models: ["claude-sonnet-4-6"],
       }),
-      provider({
-        instanceId: "claude_openrouter",
-        models: ["claude-sonnet-4-6"],
-      }),
+      withServerCustomModels(
+        provider({
+          instanceId: "claude_openrouter",
+          models: ["claude-sonnet-4-6"],
+        }),
+        ["openai/gpt-5.5"],
+      ),
     ];
     const entries = deriveProviderInstanceEntries(providers);
     const stock = entries.find((entry) => entry.instanceId === "claudeAgent")!;
@@ -246,11 +263,14 @@ describe("instance-scoped model selection", () => {
 
   it("preserves a custom slug that collides with a provider alias", () => {
     const providers = [
-      provider({
-        provider: ProviderDriverKind.make("claudeAgent"),
-        instanceId: "claude_openrouter",
-        models: ["claude-opus-4-8"],
-      }),
+      withServerCustomModels(
+        provider({
+          provider: ProviderDriverKind.make("claudeAgent"),
+          instanceId: "claude_openrouter",
+          models: ["claude-opus-4-8"],
+        }),
+        ["opus"],
+      ),
     ];
     const settings: UnifiedSettings = {
       ...settingsWithProviderInstances(),
@@ -278,13 +298,16 @@ describe("instance-scoped model selection", () => {
   });
 
   it("offers and resolves every saved custom model, past the first 32", () => {
-    const providers = [
-      provider({
-        provider: ProviderDriverKind.make("claudeAgent"),
-        instanceId: "claude_openrouter",
-      }),
-    ];
     const customModels = Array.from({ length: 40 }, (_, index) => `proxy/model-${index + 1}`);
+    const providers = [
+      withServerCustomModels(
+        provider({
+          provider: ProviderDriverKind.make("claudeAgent"),
+          instanceId: "claude_openrouter",
+        }),
+        customModels,
+      ),
+    ];
     const settings: UnifiedSettings = {
       ...settingsWithProviderInstances(),
       providerInstances: {
@@ -310,6 +333,18 @@ describe("instance-scoped model selection", () => {
     ).toBe("proxy/model-40");
   });
 
+  it("offers no settings custom model the server does not list", () => {
+    const openrouter = deriveProviderInstanceEntries([
+      provider({ instanceId: "claude_openrouter", models: ["claude-opus-5-5"] }),
+    ])[0]!;
+
+    expect(
+      getAppModelOptionsForInstance(settingsWithProviderInstances(), openrouter).map(
+        (option) => option.slug,
+      ),
+    ).toEqual(["claude-opus-5-5"]);
+  });
+
   it("drops server-reported custom rows that are no longer in settings", () => {
     const baseProvider = provider({
       instanceId: "claude_openrouter",
@@ -321,6 +356,7 @@ describe("instance-scoped model selection", () => {
         models: [
           ...baseProvider.models,
           { slug: "removed/custom", name: "removed/custom", isCustom: true, capabilities: {} },
+          { slug: "openai/gpt-5.5", name: "openai/gpt-5.5", isCustom: true, capabilities: {} },
         ],
       },
     ];
@@ -719,7 +755,10 @@ describe("instance-scoped model selection", () => {
     const driver = ProviderDriverKind.make("claudeAgent");
     const providers = [
       provider({ provider: driver, instanceId: "claudeAgent", models: ["claude-opus-5"] }),
-      provider({ provider: driver, instanceId, models: ["claude-opus-5"] }),
+      withServerCustomModels(
+        provider({ provider: driver, instanceId, models: ["claude-opus-5"] }),
+        ["openai/gpt-5.5"],
+      ),
     ];
     const threadSelection = createModelSelection(instanceId, "claude-opus-5", [
       { id: "effort", value: "high" },

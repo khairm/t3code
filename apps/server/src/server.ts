@@ -733,6 +733,7 @@ const layerMakeRoutes = Layer.mergeAll(
     ServerHttp.layerOtlpTracesProxyRoute,
     // fork:model-allowlist
     ServerHttp.layerHoldQueuePromotionRoute,
+    ServerHttp.layerReleaseQueuePromotionRoute,
     ServerHttp.layerAssetRoute,
     ServerHttp.layerAttachmentUploadRoute,
     GuestHttp.layer,

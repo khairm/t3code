@@ -38,7 +38,7 @@ import {
   type ServerProviderDraft,
 } from "@t3tools/provider-core/server/snapshotProbe";
 import { resolveClaudeSdkExecutablePath } from "./Drivers/ClaudeExecutable.ts";
-import { filterAllowedModels } from "./allowedModels.ts";
+import { filterAllowedModels, isModelAllowed } from "./allowedModels.ts";
 import { hasClaudeManagedMcpConfig, makeClaudeEnvironment } from "./Drivers/ClaudeHome.ts";
 import { discoverClaudeSkills, readClaudeSettingsBaseUrl } from "./Drivers/ClaudeSkills.ts";
 import type { ProviderWorkspaceSnapshot } from "@t3tools/provider-core/server/driver";
@@ -452,13 +452,14 @@ export const probeClaudeWorkspaceSnapshot = Effect.fn("probeClaudeWorkspaceSnaps
 });
 
 // fork:model-allowlist
+const CLAUDE_DRIVER = ProviderDriverKind.make("claudeAgent");
 const claudeModelsFromSettings = (
   builtInModels: ReadonlyArray<ServerProviderModel>,
   customModels: ClaudeSettings["customModels"],
 ) =>
   filterAllowedModels(
     providerModelsFromSettings(builtInModels, customModels, DEFAULT_CLAUDE_MODEL_CAPABILITIES),
-    ProviderDriverKind.make("claudeAgent"),
+    CLAUDE_DRIVER,
   );
 
 export const checkClaudeProviderStatus = Effect.fn("checkClaudeProviderStatus")(function* (
@@ -573,8 +574,12 @@ export const checkClaudeProviderStatus = Effect.fn("checkClaudeProviderStatus")(
     resolveClaudeModelsForVersion(modelCatalog, parsedVersion),
     claudeSettings.customModels,
   );
-  const updateRequiredModels = resolveClaudeUpdateRequiredModels(modelCatalog, parsedVersion);
-  const versionUpgradeMessage = formatClaudeVersionUpgradeMessage(modelCatalog, parsedVersion);
+  // fork:model-allowlist: no upgrade prompt for a blocked model.
+  const allowedCatalog = {
+    models: modelCatalog.models.filter((entry) => isModelAllowed(entry.model.slug, CLAUDE_DRIVER)),
+  };
+  const updateRequiredModels = resolveClaudeUpdateRequiredModels(allowedCatalog, parsedVersion);
+  const versionUpgradeMessage = formatClaudeVersionUpgradeMessage(allowedCatalog, parsedVersion);
 
   const probeResult = resolveCapabilities
     ? yield* resolveCapabilities(claudeSettings).pipe(Effect.result)

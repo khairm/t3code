@@ -26,6 +26,8 @@ import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as ServerHttp from "../http.ts";
 import * as McpHttpServer from "../mcp/McpHttpServer.ts";
 import * as McpSessionRegistry from "../mcp/McpSessionRegistry.ts";
+import * as QueuePromotionHold from "../orchestration-v2/QueuePromotionHold.ts";
+import * as ThreadCommandExecutor from "../orchestration-v2/ThreadCommandExecutor.ts";
 import * as Sqlite from "../persistence/Sqlite.ts";
 import * as PeerLinks from "./PeerLinks.ts";
 import * as ServerSettings from "../serverSettings.ts";
@@ -98,7 +100,14 @@ export const servePeer = <E, R>(
     const layerRoutes = Layer.mergeAll(
       HttpApiBuilder.layer(PeerTestApi).pipe(
         Layer.provide(McpOAuthHttp.layer.pipe(Layer.provide(McpOAuth.layer))),
-        Layer.provide(ServerHttp.layerServerEnvironmentHttpApi),
+        Layer.provide(
+          ServerHttp.layerServerEnvironmentHttpApi.pipe(
+            // fork:model-allowlist: the descriptor reports the queue promotion hold.
+            Layer.provide(
+              QueuePromotionHold.layer.pipe(Layer.provide(ThreadCommandExecutor.layer)),
+            ),
+          ),
+        ),
         Layer.provide(AuthHttp.layerAuthenticatedAuth),
       ),
       tools.pipe(

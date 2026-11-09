@@ -18,6 +18,11 @@ import type { ManagedServerProvider } from "@t3tools/provider-core/server/snapsh
 import type { CodexEffectiveRuntime } from "../../provider/CodexManagedRuntime.ts";
 import { classifyCodexManagedError } from "../../provider/CodexManagedErrors.ts";
 import {
+  CODEX_HELPERS_OFF_CONFIG,
+  isModelAllowed,
+  modelNotAllowedFailure,
+} from "../../provider/allowedModels.ts";
+import {
   buildCodexInitializeParams,
   codexAppServerEnvironment,
   codexDefaultReasoningEffortOverride,
@@ -1128,6 +1133,8 @@ interface ActiveCodexTurnContext {
     readonly nativeCode: string | null;
     readonly failure: OrchestrationV2ProviderFailure;
   };
+  /** fork:model-allowlist: Codex rerouted the turn to a blocked model; it ends failed. */
+  blockedRerouteFailure?: OrchestrationV2ProviderFailure;
   readonly nativeStartReady?: Deferred.Deferred<void>;
   readonly input: ProviderAdapter.ProviderAdapterV2TurnInput;
   readonly projectionAppThread: OrchestrationV2AppThread;
@@ -1328,10 +1335,8 @@ export class CodexAppServerClientFactory extends Context.Service<
 export const CODEX_THREAD_CONFIG = {
   "tools.update_plan.enabled": true,
   mcp_optional_startup_grace_ms: 10_000,
-  // fork:model-allowlist: native helpers can't be model-checked; helpers go through delegate_task.
-  // Runtime config outranks every user, profile and project file, and multi_agent_v2 wins first.
-  "agents.enabled": false,
-  "features.multi_agent_v2": false,
+  // fork:model-allowlist: runtime config outranks every user, profile and project file.
+  ...CODEX_HELPERS_OFF_CONFIG,
 } as const;
 
 // T3 waits can block for an hour; keep Codex's MCP timeout above that.
@@ -4480,7 +4485,35 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           ),
         );
         yield* client.handleServerNotification("model/rerouted", (payload) =>
-          updateSubagentSelection(payload.threadId, payload.toModel),
+          Effect.gen(function* () {
+            // fork:model-allowlist: fail the run as a blocked turn start does, holding its queue.
+            if (!isModelAllowed(payload.toModel, CODEX_PROVIDER)) {
+              const context = yield* awaitActiveTurn(payload.turnId);
+              yield* Effect.logError("orchestration-v2.codex-rerouted-to-blocked-model", {
+                nativeThreadId: payload.threadId,
+                nativeTurnId: payload.turnId,
+                fromModel: payload.fromModel,
+                toModel: payload.toModel,
+                knownTurn: context !== undefined,
+              });
+              if (context !== undefined) {
+                context.blockedRerouteFailure = modelNotAllowedFailure(payload.toModel);
+              }
+              yield* client
+                .request("turn/interrupt", { threadId: payload.threadId, turnId: payload.turnId })
+                .pipe(
+                  Effect.catch((cause) =>
+                    Effect.logError("orchestration-v2.codex-blocked-reroute-interrupt-failed", {
+                      nativeThreadId: payload.threadId,
+                      nativeTurnId: payload.turnId,
+                      cause,
+                    }),
+                  ),
+                  Effect.forkIn(scope),
+                );
+            }
+            yield* updateSubagentSelection(payload.threadId, payload.toModel);
+          }),
         );
 
         yield* client.handleServerNotification("turn/started", (payload) =>
@@ -5701,7 +5734,9 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               // completion still decides the class; a missing one is not evidence.
               const exhaustionStatus = codexExhaustionHttpStatus(input.failureErrorInfo);
               const failure =
-                previousFailure !== undefined &&
+                // fork:model-allowlist
+                input.context.blockedRerouteFailure ??
+                (previousFailure !== undefined &&
                 (input.failureMessage === undefined ||
                   input.failureMessage === previousFailure.nativeMessage) &&
                 (failureCode === undefined || failureCode === previousFailure.nativeCode) &&
@@ -5714,7 +5749,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                         class: failureClass,
                       }),
                       input.failureMessage,
-                    );
+                    ));
               return {
                 type: "turn.terminal",
                 driver: CODEX_PROVIDER,
@@ -6450,9 +6485,10 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               return;
             }
             const nativeStatus = mapCodexTurnStatus(payload.turn.status);
-            const status =
-              nativeStatus === "completed" &&
-              (yield* Ref.get(interruptingNativeTurns)).has(payload.turn.id)
+            const status = context.blockedRerouteFailure
+              ? "failed"
+              : nativeStatus === "completed" &&
+                  (yield* Ref.get(interruptingNativeTurns)).has(payload.turn.id)
                 ? "interrupted"
                 : nativeStatus;
             const terminal = {

@@ -756,7 +756,8 @@ it.layer(NodeServices.layer)("server settings", (it) => {
       });
 
       assert.equal(next.textGenerationModelSelection.instanceId, "claudeAgent");
-      assert.equal(next.textGenerationModelSelection.model, "claude-haiku-5-5");
+      // fork:model-allowlist: Claude's text generation default is Opus 5.5.
+      assert.equal(next.textGenerationModelSelection.model, "claude-opus-5-5");
     }).pipe(Effect.provide(layerServerSettings())),
   );
 
@@ -794,7 +795,7 @@ it.layer(NodeServices.layer)("server settings", (it) => {
       const builtIn = yield* serverSettings.updateSettings({
         defaultModelSelection: { instanceId: claude, model: "claude-fable-5-1" },
       });
-      assert.equal(builtIn.textGenerationModelSelection.model, "claude-haiku-5-5");
+      assert.equal(builtIn.textGenerationModelSelection.model, "claude-opus-5-5");
     }).pipe(Effect.provide(layerServerSettings())),
   );
 

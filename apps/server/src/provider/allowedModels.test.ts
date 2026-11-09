@@ -51,16 +51,33 @@ describe("T3_ALLOWED_MODELS", () => {
     }).pipe(withProductionAllowlist),
   );
 
-  it.effect("allows the listed slugs, with or without a 1M context, and nothing else", () =>
+  it.effect("allows each listed slug only on its own provider", () =>
     Effect.sync(() => {
-      for (const model of ["claude-opus-5-5", "claude-fable-5-1[1m]", "claude-mythos-5-1[1m]"]) {
-        assert.isTrue(isModelAllowed(model, claude), model);
-      }
-      for (const model of ["claude-sonnet-5-5", "claude-haiku-5-5", "claude-opus-5", "opus"]) {
-        assert.isFalse(isModelAllowed(model, claude), model);
-      }
+      const allowedOnClaude = [
+        "claude-opus-5-5",
+        "claude-fable-5-1[1m]",
+        "claude-mythos-5-1[1m]",
+        "opus",
+        "Opus",
+        "opus-5.5",
+        "FABLE[1m]",
+      ];
+      for (const model of allowedOnClaude) assert.isTrue(isModelAllowed(model, claude), model);
+      const blockedOnClaude = [
+        "claude-sonnet-5-5",
+        "sonnet",
+        "haiku",
+        "claude-opus-5",
+        "opus-5",
+        "gpt-6-astra",
+        "claude-opus-5-5[2m]",
+      ];
+      for (const model of blockedOnClaude) assert.isFalse(isModelAllowed(model, claude), model);
       assert.isTrue(isModelAllowed("openai.gpt-6-astra", codex));
-      assert.isFalse(isModelAllowed("gpt-6-luna", codex));
+      for (const model of ["gpt-6-luna", "gpt-6-astra[1m]", "claude-opus-5-5", "opus"]) {
+        assert.isFalse(isModelAllowed(model, codex), model);
+      }
+      assert.isFalse(isModelAllowed("gpt-6-astra", ProviderDriverKind.make("opencode")));
       assert.deepEqual(
         filterAllowedModels(
           [{ slug: "claude-opus-5-5" }, { slug: "codex-gpt-6-luna" }, { slug: "claude-fable-5" }],
@@ -90,7 +107,10 @@ describe("every turn start passes the allowlist check", () => {
   it("starts provider turns only from the known places", () => {
     assert.deepEqual(callers(/providerTurnStart\.start\(/), ["orchestration-v2/EffectWorker.ts"]);
     assert.deepEqual(callers(/\.startRootRun\(/), ["orchestration-v2/ProviderTurnStartService.ts"]);
-    assert.deepEqual(callers(/\.(startTurn|compactThread)\??\.?\(/), [
+    // Calls, values passed on (`session.startTurn`), bracket access and destructuring.
+    const turnStarts =
+      /\.(startTurn|compactThread)\b(?!["'`])|\[\s*["'`](startTurn|compactThread)["'`]\s*\]|\{[^{}]*\b(startTurn|compactThread)\b[^{}]*\}\s*=[^=>]/;
+    assert.deepEqual(callers(turnStarts), [
       "orchestration-v2/ProviderSessionManager.ts",
       "orchestration-v2/ProviderTurnStartService.ts",
       "orchestration-v2/RunExecutionService.ts",

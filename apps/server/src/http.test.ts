@@ -13,6 +13,8 @@ import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as PlatformError from "effect/PlatformError";
 import * as Queue from "effect/Queue";
+import * as Stream from "effect/Stream";
+import * as TestClock from "effect/testing/TestClock";
 import * as Tracer from "effect/Tracer";
 import { HttpClient, HttpClientRequest, HttpRouter, HttpServerResponse } from "effect/http";
 import { ASSET_ROUTE_PREFIX } from "./assets/AssetAccess.ts";
@@ -25,9 +27,19 @@ import {
   injectMcpAppThemeBootstrap,
   MCP_APP_MAX_HTML_BYTES,
 } from "@t3tools/shared/mcpApp";
-import { ORCHESTRATION_PROTOCOL_HEADER } from "@t3tools/contracts";
+import {
+  AuthEnvironmentMaintainScope,
+  AuthOrchestrationReadScope,
+  AuthSessionId,
+  ORCHESTRATION_PROTOCOL_HEADER,
+  ThreadId,
+} from "@t3tools/contracts";
 
+import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
 import * as ServerConfig from "./config.ts";
+import * as QueuePromotionHold from "./orchestration-v2/QueuePromotionHold.ts";
+import * as ThreadCommandExecutor from "./orchestration-v2/ThreadCommandExecutor.ts";
+import * as KeyedLock from "@t3tools/shared/KeyedLock";
 
 import { assetResponseHeaders, assetFileResponse, downloadContentDisposition } from "./http.ts";
 import * as ServerHttp from "./http.ts";
@@ -853,4 +865,134 @@ describe("downloadContentDisposition", () => {
       `attachment; filename="bad_name.pdf"; filename*=UTF-8''bad%EF%BF%BDname.pdf`,
     );
   });
+});
+
+// fork:model-allowlist
+describe("queue promotion hold routes", () => {
+  const layerAuth = Layer.mock(EnvironmentAuth.EnvironmentAuth)({
+    authenticateHttpRequest: (request) => {
+      const token = request.headers.authorization?.replace(/^Bearer /, "");
+      if (token === undefined)
+        return Effect.fail(new EnvironmentAuth.ServerAuthMissingCredentialError());
+      return Effect.succeed({
+        sessionId: AuthSessionId.make(`session-${token}`),
+        subject: token,
+        method: "bearer-access-token",
+        scopes:
+          token === "maintain" ? [AuthEnvironmentMaintainScope] : [AuthOrchestrationReadScope],
+      });
+    },
+  });
+  const serveHoldRoutes = Effect.fn("serveHoldRoutes")(function* (
+    layerThreadLocks: Layer.Layer<ThreadCommandExecutor.ThreadCommandExecutor> = ThreadCommandExecutor.layer,
+  ) {
+    const services = yield* Layer.build(
+      HttpRouter.serve(
+        Layer.merge(
+          ServerHttp.layerHoldQueuePromotionRoute,
+          ServerHttp.layerReleaseQueuePromotionRoute,
+        ),
+        { disableListenLog: true, disableLogger: true },
+      ).pipe(
+        Layer.provideMerge(QueuePromotionHold.layer),
+        Layer.provideMerge(layerThreadLocks),
+        Layer.provide(layerAuth),
+        Layer.provideMerge(NodeHttpServer.layerTest),
+      ),
+    );
+    const client = Context.get(services, HttpClient.HttpClient);
+    const post = (path: string, token?: string) =>
+      client.execute(
+        HttpClientRequest.post(path).pipe(
+          token === undefined ? (request) => request : HttpClientRequest.bearerToken(token),
+        ),
+      );
+    return {
+      post,
+      hold: Context.get(services, QueuePromotionHold.QueuePromotionHold),
+      threadLocks: Context.get(services, ThreadCommandExecutor.ThreadCommandExecutor),
+    };
+  });
+  const paths = [ServerHttp.HOLD_QUEUE_PROMOTION_PATH, ServerHttp.RELEASE_QUEUE_PROMOTION_PATH];
+
+  it.effect("refuses a missing credential and a session without environment:maintain", () =>
+    Effect.gen(function* () {
+      const { post, hold } = yield* serveHoldRoutes();
+      for (const path of paths) {
+        expect((yield* post(path)).status).toBe(401);
+        expect((yield* post(path, "read")).status).toBe(403);
+      }
+      expect(yield* hold.heldSince).toBeNull();
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("holds, reports since when, and releases", () =>
+    Effect.gen(function* () {
+      const { post, hold } = yield* serveHoldRoutes();
+      const held = yield* post(ServerHttp.HOLD_QUEUE_PROMOTION_PATH, "maintain");
+      expect(held.status).toBe(200);
+      const heldBody = (yield* held.json) as Record<string, unknown>;
+      expect(heldBody.queuePromotionHeld).toBe(true);
+      expect(typeof heldBody.queuePromotionHeldSince).toBe("string");
+      expect(yield* hold.heldSince).not.toBeNull();
+
+      const released = yield* post(ServerHttp.RELEASE_QUEUE_PROMOTION_PATH, "maintain");
+      expect(released.status).toBe(200);
+      expect(yield* released.json).toEqual({ queuePromotionHeld: false });
+      expect(yield* hold.heldSince).toBeNull();
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("replies to a hold only once a start decision already under way has committed", () =>
+    Effect.gen(function* () {
+      // The second lock taken is the hold waiting for the decision's thread.
+      const drainReached = yield* Deferred.make<void>();
+      let lockUsers = 0;
+      const layerSpyLocks = Layer.effect(
+        ThreadCommandExecutor.ThreadCommandExecutor,
+        Effect.map(KeyedLock.make<ThreadId>(), (locks) => ({
+          ...locks,
+          withLock: <A, E, R>(threadId: ThreadId, effect: Effect.Effect<A, E, R>) =>
+            Effect.suspend(() =>
+              (++lockUsers === 2 ? Deferred.succeed(drainReached, undefined) : Effect.void).pipe(
+                Effect.andThen(locks.withLock(threadId, effect)),
+              ),
+            ),
+        })),
+      );
+      const { post, hold, threadLocks } = yield* serveHoldRoutes(layerSpyLocks);
+      const decisionStarted = yield* Deferred.make<void>();
+      const commit = yield* Deferred.make<void>();
+      const decision = yield* threadLocks
+        .withLock(
+          ThreadId.make("thread-in-flight"),
+          Deferred.succeed(decisionStarted, undefined).pipe(Effect.andThen(Deferred.await(commit))),
+        )
+        .pipe(Effect.forkScoped);
+      yield* Deferred.await(decisionStarted);
+      const reply = yield* post(ServerHttp.HOLD_QUEUE_PROMOTION_PATH, "maintain").pipe(
+        Effect.forkScoped,
+      );
+      yield* Deferred.await(drainReached);
+      expect(yield* hold.heldSince).not.toBeNull();
+      expect(reply.pollUnsafe()).toBeUndefined();
+      yield* Deferred.succeed(commit, undefined);
+      yield* Fiber.join(decision);
+      expect((yield* Fiber.join(reply)).status).toBe(200);
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("releases itself after 30 minutes without a restart", () =>
+    Effect.gen(function* () {
+      const { post, hold } = yield* serveHoldRoutes();
+      const released = yield* hold.releases.pipe(Stream.runHead, Effect.forkScoped);
+      yield* Effect.yieldNow;
+      expect((yield* post(ServerHttp.HOLD_QUEUE_PROMOTION_PATH, "maintain")).status).toBe(200);
+      yield* TestClock.adjust("29 minutes");
+      expect(yield* hold.heldSince).not.toBeNull();
+      yield* TestClock.adjust("1 minute");
+      yield* Fiber.join(released);
+      expect(yield* hold.heldSince).toBeNull();
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
 });

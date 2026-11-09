@@ -539,23 +539,6 @@ export const layer: Layer.Layer<
           });
         },
       );
-      // fork:model-allowlist: every run starts here, so this is the one turn-start check.
-      // Not settleStartFailure: its provider_error would make the pilot hop and retry.
-      if (!isModelAllowed(run.modelSelection.model, providerThread.driver)) {
-        yield* settleRunBeforeStart({
-          signal: "model-not-allowed",
-          status: "failed",
-          now: yield* DateTime.now,
-          providerInstanceId: run.providerInstanceId,
-          itemProviderThreadId: providerThread.id,
-          item: {
-            type: "error",
-            title: "Model not allowed",
-            failure: modelNotAllowedFailure(run.modelSelection.model),
-          },
-        });
-        return;
-      }
       if (message.attachments.length === 0 && message.text.trimStart().startsWith("/")) {
         const isEmptyCompaction =
           message.text.trim().toLowerCase() === "/compact" && !projection.hasConversation;
@@ -640,6 +623,25 @@ export const layer: Layer.Layer<
           });
           return;
         }
+      }
+      // fork:model-allowlist: every run starts here, so this is the one turn-start check; account
+      // commands above still run. Not settleStartFailure: its provider_error makes the pilot hop.
+      if (!isModelAllowed(run.modelSelection.model, providerThread.driver)) {
+        const now = yield* DateTime.now;
+        yield* settleRunBeforeStart({
+          signal: "model-not-allowed",
+          status: "failed",
+          now,
+          startedAt: now,
+          providerInstanceId: run.providerInstanceId,
+          itemProviderThreadId: providerThread.id,
+          item: {
+            type: "error",
+            title: "Model not allowed",
+            failure: modelNotAllowedFailure(run.modelSelection.model),
+          },
+        });
+        return;
       }
       const { worktreePath, branch } = projection.thread;
       if (worktreePath !== null && branch !== null) {

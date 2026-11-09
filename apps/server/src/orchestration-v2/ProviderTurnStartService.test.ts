@@ -1194,6 +1194,7 @@ effectIt.effect("refuses a blocked model before opening its session, without a p
 
     expect(harness.open).not.toHaveBeenCalled();
     expect(harness.projection().runs.at(-1)?.status).toBe("failed");
+    expect(harness.projection().runs.at(-1)?.startedAt).not.toBeNull();
     expect(harness.projection().turnItems.at(-1)).toMatchObject({
       type: "error",
       status: "failed",
@@ -1203,6 +1204,18 @@ effectIt.effect("refuses a blocked model before opening its session, without a p
         message: "Model not allowed: gpt-5.4",
       },
     });
+  }).pipe(withProductionAllowlist),
+);
+
+effectIt.effect("still runs an account command on a blocked model", () =>
+  Effect.gen(function* () {
+    const harness = makeLocalCommandHarness({ text: "/logout", previousNativeSession: true });
+
+    yield* harness.start;
+
+    expect(harness.tryHandlePromptCommand).toHaveBeenCalledOnce();
+    expect(harness.open).not.toHaveBeenCalled();
+    expect(harness.projection().runs.at(-1)?.status).toBe("completed");
   }).pipe(withProductionAllowlist),
 );
 

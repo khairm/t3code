@@ -261,6 +261,10 @@ function normalizeThreadRequest(frame: unknown, ignoredConfigKeys: ReadonlySet<s
     ),
   );
   for (const key of ignoredConfigKeys) delete owned[key];
+  // fork:model-allowlist: the fork turns Codex helpers off on every thread; upstream's replays
+  // predate it, and CodexAdapterV2.test.ts checks the keys are sent.
+  delete owned["agents.enabled"];
+  delete owned["features.multi_agent_v2"];
   return { ...record, params: { ...params, config: owned } };
 }
 

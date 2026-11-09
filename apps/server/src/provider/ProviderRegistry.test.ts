@@ -71,6 +71,7 @@ import type {
 import * as ProviderInstanceRegistry from "./ProviderInstanceRegistry.ts";
 import * as ProviderInstanceRegistryMutator from "./ProviderInstanceRegistryMutator.ts";
 import * as ProviderRegistry from "./ProviderRegistry.ts";
+import { withProductionAllowlist } from "./allowedModels.testkit.ts";
 import { mergeProviderInstanceEnvironment } from "@t3tools/provider-core/server/instanceEnvironment";
 import { makeManualOnlyProviderMaintenanceCapabilities } from "@t3tools/provider-core/server/maintenanceResolver";
 vi.mock("@anthropic-ai/claude-agent-sdk", { spy: true });
@@ -1277,6 +1278,93 @@ it.layer(
           Effect.provide(
             ServerConfig.layerTest(process.cwd(), {
               prefix: "t3-codex-retired-model-cache-",
+            }).pipe(Layer.provideMerge(NodeServices.layer)),
+          ),
+        ),
+      );
+
+      // fork:model-allowlist
+      it.effect("never brings back a blocked model from the cache or a merge", () =>
+        Effect.gen(function* () {
+          const config = yield* ServerConfig.ServerConfig;
+          const model = (slug: string) => ({
+            slug,
+            name: slug,
+            isCustom: false,
+            capabilities: null,
+          });
+          const staleProvider = {
+            ...cachedProvider,
+            models: [model("gpt-6-luna"), model("gpt-6.1-sol")],
+            updateRequiredModels: [{ slug: "gpt-6-luna", name: "gpt-6-luna", minVersion: "9.9.9" }],
+          } satisfies ServerProvider;
+          const filePath = yield* resolveProviderStatusCachePath({
+            cacheDir: config.providerStatusCacheDir,
+            instanceId: staleProvider.instanceId,
+          });
+          yield* writeProviderStatusCache({ filePath, provider: staleProvider });
+          const instance = {
+            instanceId: staleProvider.instanceId,
+            driverKind: staleProvider.driver,
+            continuationIdentity: {
+              driverKind: staleProvider.driver,
+              continuationKey: "codex:instance:codex-personal",
+            },
+            displayName: undefined,
+            enabled: true,
+            snapshot: {
+              resolveMaintenance: () =>
+                Effect.succeed(
+                  makeManualOnlyProviderMaintenanceCapabilities({
+                    provider: staleProvider.driver,
+                    packageName: null,
+                  }),
+                ),
+              getSnapshot: Effect.succeed({ ...pendingProvider, models: [] }),
+              refresh: Effect.succeed(staleProvider),
+              streamChanges: Stream.empty,
+              applyUsageLimits: () => Effect.void,
+            },
+            orchestrationAdapter: {} as ProviderInstance["orchestrationAdapter"],
+            textGeneration: {} as ProviderInstance["textGeneration"],
+          } satisfies ProviderInstance;
+          const layerInstanceRegistry = Layer.succeed(
+            ProviderInstanceRegistry.ProviderInstanceRegistry,
+            {
+              getInstance: (id) =>
+                Effect.succeed(id === instance.instanceId ? instance : undefined),
+              listInstances: Effect.succeed([instance]),
+              listUnavailable: Effect.succeed([]),
+              streamChanges: Stream.empty,
+              subscribeChanges: Effect.flatMap(PubSub.unbounded<void>(), PubSub.subscribe),
+            },
+          );
+          yield* Effect.gen(function* () {
+            const registry = yield* ProviderRegistry.ProviderRegistry;
+            for (const providers of [
+              yield* registry.getProviders,
+              yield* registry.refreshInstance(instance.instanceId),
+            ]) {
+              assert.deepStrictEqual(
+                providers[0]?.models.map((candidate) => candidate.slug),
+                ["gpt-6.1-sol"],
+              );
+              assert.deepStrictEqual(providers[0]?.updateRequiredModels ?? [], []);
+            }
+          }).pipe(
+            Effect.provide(
+              ProviderRegistry.layer.pipe(
+                Layer.provide(layerInstanceRegistry),
+                Layer.provide(layerUnusedMutator),
+              ),
+            ),
+            Effect.scoped,
+          );
+        }).pipe(
+          withProductionAllowlist,
+          Effect.provide(
+            ServerConfig.layerTest(process.cwd(), {
+              prefix: "t3-codex-blocked-model-cache-",
             }).pipe(Layer.provideMerge(NodeServices.layer)),
           ),
         ),
@@ -2520,6 +2608,43 @@ it.layer(
           { slug: "claude-next", name: "Next", minVersion: "1.1.0" },
         ]);
       }).pipe(
+        Effect.provide(
+          layerMockSpawner((args) => {
+            const joined = args.join(" ");
+            if (joined === "--version") return { stdout: "1.0.0\n", stderr: "", code: 0 };
+            throw new Error(`Unexpected args: ${joined}`);
+          }),
+        ),
+      ),
+    );
+
+    // fork:model-allowlist
+    it.effect("asks for no Claude Code update for a blocked model", () =>
+      Effect.gen(function* () {
+        const entry = (slug: string, minVersion: string) => ({
+          model: { slug, name: slug, isCustom: false, capabilities: null },
+          runtime: {},
+          compatibility: { minVersion },
+        });
+        const status = yield* checkClaudeProviderStatus(
+          defaultClaudeSettings,
+          claudeCapabilities({
+            tokenSource: "none",
+            apiKeySource: "none",
+            apiProvider: "firstParty",
+          }),
+          // An authenticated provider, so the status carries the upgrade message.
+          { ANTHROPIC_BASE_URL: "https://proxy.example/api" },
+          undefined,
+          { models: [entry("claude-sonnet-5-5", "1.1.0"), entry("claude-opus-5-5", "1.2.0")] },
+        );
+        assert.deepStrictEqual(
+          status.updateRequiredModels?.map((model) => model.slug),
+          ["claude-opus-5-5"],
+        );
+        assert.include(status.message, "too old for claude-opus-5-5");
+      }).pipe(
+        withProductionAllowlist,
         Effect.provide(
           layerMockSpawner((args) => {
             const joined = args.join(" ");

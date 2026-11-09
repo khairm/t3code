@@ -86,14 +86,10 @@ import * as TerminalManager from "../terminal/Manager.ts";
 import * as ResourceCleanupService from "./ResourceCleanupService.ts";
 import * as ThreadLaunchService from "./ThreadLaunchService.ts";
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
+import * as QueuePromotionHold from "./QueuePromotionHold.ts";
+import { withProductionAllowlist } from "../provider/allowedModels.testkit.ts";
+import { userFacingDispatchErrorMessage } from "./UserFacingErrors.ts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
-
-// fork:model-allowlist
-const queuePromotionHold = vi.hoisted(() => ({ held: vi.fn(() => false) }));
-vi.mock("./QueuePromotionHold.ts", () => ({
-  holdQueuePromotion: () => undefined,
-  queuePromotionHeld: queuePromotionHold.held,
-}));
 
 const layerPlatformTest = Layer.merge(
   NodeServices.layer,
@@ -5884,10 +5880,9 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
   );
 
   // fork:model-allowlist
-  const activeAndQueued = (threadId: ThreadId) =>
-    Effect.gen(function* () {
-      const orchestrator = yield* Orchestrator.OrchestratorV2;
-      yield* orchestrator.dispatch({
+  const createThread = (threadId: ThreadId) =>
+    Effect.flatMap(Orchestrator.OrchestratorV2, (orchestrator) =>
+      orchestrator.dispatch({
         type: "thread.create",
         createdBy: "user",
         creationSource: "web",
@@ -5900,7 +5895,13 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         interactionMode: "default",
         branch: null,
         worktreePath: process.cwd(),
-      });
+      }),
+    );
+
+  const activeAndQueued = (threadId: ThreadId) =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      yield* createThread(threadId);
       for (const [index, text] of ["Active", "Queued"].entries()) {
         yield* orchestrator.dispatch({
           type: "message.dispatch",
@@ -5919,6 +5920,36 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
       return { active: runs[0]!, queued: runs[1]! };
     });
 
+  /** Forks a wait for the next update of `runId` that `matches`. */
+  const runUpdated = (
+    threadId: ThreadId,
+    runId: RunId,
+    matches: (run: {
+      readonly status: string;
+      readonly queueHeld?: boolean | undefined;
+    }) => boolean,
+  ) =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const eventSink = yield* EventSink.EventSinkV2;
+      return yield* eventSink
+        .stream({ threadId, afterSequence: yield* orchestrator.getThreadEventSequence(threadId) })
+        .pipe(
+          Stream.filter(
+            (stored) =>
+              stored.event.type === "run.updated" &&
+              stored.event.payload.id === runId &&
+              matches(stored.event.payload),
+          ),
+          Stream.runHead,
+          Effect.forkScoped,
+        );
+    });
+
+  const releaseHold = Effect.ensuring(
+    Effect.flatMap(QueuePromotionHold.QueuePromotionHold, (hold) => hold.release),
+  );
+
   it.effect("holds the queue after a model_not_allowed failure", () =>
     Effect.gen(function* () {
       const orchestrator = yield* Orchestrator.OrchestratorV2;
@@ -5926,18 +5957,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
       const threadId = ThreadId.make("runtime-layer-model-not-allowed-queue");
       const { active, queued } = yield* activeAndQueued(threadId);
       assert.isNotNull(active.rootNodeId);
-      const held = yield* eventSink
-        .stream({ threadId, afterSequence: yield* orchestrator.getThreadEventSequence(threadId) })
-        .pipe(
-          Stream.filter(
-            (stored) =>
-              stored.event.type === "run.updated" &&
-              stored.event.payload.id === queued.id &&
-              stored.event.payload.queueHeld === true,
-          ),
-          Stream.runHead,
-          Effect.forkScoped,
-        );
+      const held = yield* runUpdated(threadId, queued.id, (run) => run.queueHeld === true);
       yield* Effect.yieldNow;
       const now = yield* DateTime.now;
       const base = {
@@ -5991,18 +6011,15 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
     }),
   );
 
-  it.effect("starts no queued run after a finished reply while promotion is held", () =>
+  it.effect("starts no queued run while promotion is held, and starts it on release", () =>
     Effect.gen(function* () {
       const orchestrator = yield* Orchestrator.OrchestratorV2;
       const eventSink = yield* EventSink.EventSinkV2;
       const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+      const hold = yield* QueuePromotionHold.QueuePromotionHold;
       const threadId = ThreadId.make("runtime-layer-held-promotion");
       const { active, queued } = yield* activeAndQueued(threadId);
-      const consulted = Deferred.makeUnsafe<void>();
-      queuePromotionHold.held.mockImplementation(() => {
-        Deferred.doneUnsafe(consulted, Effect.void);
-        return true;
-      });
+      yield* hold.hold;
       const now = yield* DateTime.now;
       yield* eventSink.write({
         events: [
@@ -6017,14 +6034,97 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
           },
         ],
       });
-      yield* Deferred.await(consulted);
+      yield* orchestrator.resumeQueuedRuns;
       yield* worker.drain();
+      const held = yield* orchestrator.getThreadProjection(threadId);
+      assert.equal(held.runs.find((run) => run.id === queued.id)?.status, "queued");
+
+      const started = yield* runUpdated(threadId, queued.id, (run) => run.status === "starting");
+      yield* Effect.yieldNow;
+      yield* hold.release;
+      yield* Fiber.join(started);
+    }).pipe(releaseHold),
+  );
+
+  it.effect("refuses queue.resume and queued-run.start while promotion is held", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const hold = yield* QueuePromotionHold.QueuePromotionHold;
+      const threadId = ThreadId.make("runtime-layer-held-resume");
+      const { queued } = yield* activeAndQueued(threadId);
+      yield* hold.hold;
+      for (const command of [
+        {
+          type: "queue.resume" as const,
+          commandId: CommandId.make(`${threadId}:resume`),
+          threadId,
+        },
+        {
+          type: "queued-run.start" as const,
+          commandId: CommandId.make(`${threadId}:start`),
+          threadId,
+          runId: queued.id,
+        },
+      ]) {
+        const refused = yield* orchestrator.dispatch(command).pipe(Effect.flip);
+        assert.equal(
+          userFacingDispatchErrorMessage(refused),
+          QueuePromotionHold.QUEUE_PROMOTION_HELD_MESSAGE,
+        );
+      }
+    }).pipe(releaseHold),
+  );
+
+  it.effect("queues a server-created message on an idle thread while promotion is held", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const hold = yield* QueuePromotionHold.QueuePromotionHold;
+      const threadId = ThreadId.make("runtime-layer-held-server-message");
+      yield* createThread(threadId);
+      yield* hold.hold;
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        createdBy: "agent",
+        creationSource: "server",
+        commandId: CommandId.make(`${threadId}:wake`),
+        threadId,
+        messageId: MessageId.make(`${threadId}:wake`),
+        text: "Helper result",
+        attachments: [],
+        modelSelection,
+        dispatchMode: { type: "start_immediately" },
+      });
+      const [run] = (yield* orchestrator.getThreadProjection(threadId)).runs;
+      assert.equal(run?.status, "queued");
+      assert.notEqual(run?.queueHeld, true);
+
+      const started = yield* runUpdated(threadId, run!.id, (run) => run.status === "starting");
+      yield* Effect.yieldNow;
+      yield* hold.release;
+      yield* Fiber.join(started);
+    }).pipe(releaseHold),
+  );
+
+  it.effect("a blocked model's run fails at start and holds the message queued behind it", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+      const threadId = ThreadId.make("runtime-layer-blocked-model-start");
+      const { active, queued } = yield* activeAndQueued(threadId);
+      const queueHeld = yield* runUpdated(threadId, queued.id, (run) => run.queueHeld === true);
+      yield* Effect.yieldNow;
+      yield* worker.drain();
+      yield* Fiber.join(queueHeld);
       const after = yield* orchestrator.getThreadProjection(threadId);
-      assert.equal(after.runs.find((run) => run.id === queued.id)?.status, "queued");
-      assert.isFalse(after.turnItems.some((item) => item.runId === queued.id));
-    }).pipe(
-      Effect.ensuring(Effect.sync(() => queuePromotionHold.held.mockImplementation(() => false))),
-    ),
+      assert.equal(after.runs.find((run) => run.id === active.id)?.status, "failed");
+      const failure = after.turnItems.find(
+        (item) => item.runId === active.id && item.type === "error",
+      );
+      assert.equal(failure?.type === "error" ? failure.failure.code : null, "model_not_allowed");
+      const waiting = after.runs.find((run) => run.id === queued.id);
+      assert.equal(waiting?.status, "queued");
+      assert.isTrue(waiting?.queueHeld);
+    }).pipe(withProductionAllowlist),
   );
 
   it.effect("places held queued messages after a continuation that started first", () =>

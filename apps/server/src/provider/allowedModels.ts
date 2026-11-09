@@ -1,21 +1,28 @@
 // fork:model-allowlist: the machine-wide model allowlist. Every model list, turn start,
 // delegate_task and text generation checks it here.
-import type { OrchestrationV2ProviderFailure, ProviderDriverKind } from "@t3tools/contracts";
+import type {
+  OrchestrationV2ProviderFailure,
+  ProviderDriverKind,
+  ServerProvider,
+} from "@t3tools/contracts";
 import { makeProviderFailure } from "@t3tools/provider-core/server/failure";
 import { codexModelFamily, normalizeModelSlug } from "@t3tools/shared/model";
+
+import { allowedModelsTestOverride } from "./allowedModelsTestOverride.ts";
+import { BUNDLED_CLAUDE_MODEL_CATALOG, resolveClaudeModelSlug } from "./ClaudeModelCatalog.ts";
 
 export const ALLOWED_MODELS_ENV = "T3_ALLOWED_MODELS";
 export const MODEL_NOT_ALLOWED_CODE = "model_not_allowed";
 
-let testOverride: "any" | undefined;
-
-/** Test setup only: upstream suites run on many model ids, so they run unrestricted. */
-export function overrideAllowedModelsForTests(value: "any" | undefined): void {
-  testOverride = value;
-}
+/** Native Codex helpers can't be model-checked, so they stay off; helpers use delegate_task. */
+export const CODEX_HELPERS_OFF_CONFIG = {
+  "agents.enabled": false,
+  "features.multi_agent_v2": false,
+} as const;
 
 /** Throws when T3_ALLOWED_MODELS is missing, empty or has an empty entry. */
 export function allowedModels(): ReadonlySet<string> | "any" {
+  const testOverride = allowedModelsTestOverride();
   if (testOverride !== undefined) return testOverride;
   const raw = process.env[ALLOWED_MODELS_ENV]?.trim() ?? "";
   const slugs = raw.split(",").map((slug) => slug.trim());
@@ -27,16 +34,32 @@ export function allowedModels(): ReadonlySet<string> | "any" {
   return new Set(slugs);
 }
 
-/** After T3's alias resolution; a 1M-context suffix keeps the slug. */
+/** The slug the allowlist names for a model on a driver, or null when no entry can match. */
+function allowlistSlug(model: string, driver: ProviderDriverKind): string | null {
+  const slug = normalizeModelSlug(model, driver);
+  if (slug === null) return null;
+  if (driver === "claudeAgent") {
+    const resolved = resolveClaudeModelSlug(
+      BUNDLED_CLAUDE_MODEL_CATALOG,
+      slug.replace(/\[1m\]$/i, ""),
+    );
+    return resolved.startsWith("claude-") ? resolved : null;
+  }
+  if (driver === "codex") {
+    const family = codexModelFamily(slug);
+    return family.startsWith("gpt-") ? family : null;
+  }
+  return null;
+}
+
 function allowedIn(
   allowed: ReadonlySet<string> | "any",
   model: string,
   driver: ProviderDriverKind,
 ): boolean {
   if (allowed === "any") return true;
-  const slug = normalizeModelSlug(model, driver)?.replace(/\[1m\]$/i, "");
-  if (slug === undefined) return false;
-  return allowed.has(driver === "codex" ? codexModelFamily(slug) : slug);
+  const slug = allowlistSlug(model, driver);
+  return slug !== null && allowed.has(slug);
 }
 
 export function isModelAllowed(model: string, driver: ProviderDriverKind): boolean {
@@ -49,6 +72,17 @@ export function filterAllowedModels<M extends { readonly slug: string }>(
 ): ReadonlyArray<M> {
   const allowed = allowedModels();
   return models.filter((model) => allowedIn(allowed, model.slug, driver));
+}
+
+/** Cached and merged snapshots too, so a stale cached model never reappears. */
+export function filterAllowedProviderModels(provider: ServerProvider): ServerProvider {
+  return {
+    ...provider,
+    models: filterAllowedModels(provider.models, provider.driver),
+    ...(provider.updateRequiredModels && {
+      updateRequiredModels: filterAllowedModels(provider.updateRequiredModels, provider.driver),
+    }),
+  };
 }
 
 export const modelNotAllowedMessage = (model: string) => `Model not allowed: ${model}`;

@@ -1,3 +1,4 @@
+import * as DateTime from "effect/DateTime";
 import * as Mime from "effect/http/Mime";
 import {
   AuthEnvironmentMaintainScope,
@@ -49,7 +50,7 @@ import {
   failEnvironmentInternal,
 } from "./auth/http.ts";
 import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
-import { holdQueuePromotion } from "./orchestration-v2/QueuePromotionHold.ts";
+import * as QueuePromotionHold from "./orchestration-v2/QueuePromotionHold.ts";
 import { WEBHOOK_ROUTE_PREFIX } from "./scheduledTasks/ScheduledTaskService.ts";
 import {
   browserApiCorsAllowedHeaders,
@@ -316,16 +317,27 @@ const authenticateRawRouteWithScope =
     }
   });
 
+// fork:model-allowlist
+const queuePromotionHealth = (heldSince: DateTime.Utc | null) => ({
+  queuePromotionHeld: heldSince !== null,
+  ...(heldSince === null ? {} : { queuePromotionHeldSince: DateTime.formatIso(heldSince) }),
+});
+
 export const layerServerEnvironmentHttpApi = HttpApiBuilder.group(
   EnvironmentHttpApi,
   "metadata",
   Effect.fnUntraced(function* (handlers) {
     const serverEnvironment = yield* ServerEnvironment.ServerEnvironment;
+    const promotionHold = yield* QueuePromotionHold.QueuePromotionHold;
     return handlers.handle(
       "descriptor",
       Effect.fn("environment.metadata.descriptor")(function* (args) {
         yield* annotateEnvironmentRequest(args.endpoint.name);
-        return yield* serverEnvironment.getDescriptor;
+        return {
+          ...(yield* serverEnvironment.getDescriptor),
+          // fork:model-allowlist: read by the Self-Hosted health endpoint.
+          ...queuePromotionHealth(yield* promotionHold.heldSince),
+        };
       }, traceRelayRequest),
     );
   }),
@@ -390,24 +402,37 @@ export const layerOtlpTracesProxyRoute = HttpRouter.add(
   ),
 );
 
-// fork:model-allowlist: the idle-gated restart calls this first, so no queued message starts
-// between its busy check and the restart. Only the restart clears it.
-const HOLD_QUEUE_PROMOTION_PATH = "/api/server/hold-queue-promotion";
-export const layerHoldQueuePromotionRoute = HttpRouter.add(
-  "POST",
+// fork:model-allowlist: the idle-gated restart holds new runs before its busy check; the
+// restart, the release route or a 30-minute expiry clears the hold.
+export const HOLD_QUEUE_PROMOTION_PATH = "/api/server/hold-queue-promotion";
+export const RELEASE_QUEUE_PROMOTION_PATH = "/api/server/release-queue-promotion";
+const queuePromotionRoute = (
+  path: HttpRouter.PathInput,
+  change: (hold: QueuePromotionHold.QueuePromotionHoldShape) => Effect.Effect<void>,
+) =>
+  HttpRouter.add(
+    "POST",
+    path,
+    Effect.gen(function* () {
+      yield* authenticateRawRouteWithScope(AuthEnvironmentMaintainScope);
+      const hold = yield* QueuePromotionHold.QueuePromotionHold;
+      yield* change(hold);
+      return HttpServerResponse.jsonUnsafe(queuePromotionHealth(yield* hold.heldSince));
+    }).pipe(
+      Effect.catchTags({
+        EnvironmentAuthInvalidError: HttpServerRespondable.toResponse,
+        EnvironmentInternalError: HttpServerRespondable.toResponse,
+        EnvironmentScopeRequiredError: HttpServerRespondable.toResponse,
+      }),
+    ),
+  );
+export const layerHoldQueuePromotionRoute = queuePromotionRoute(
   HOLD_QUEUE_PROMOTION_PATH,
-  Effect.gen(function* () {
-    yield* authenticateRawRouteWithScope(AuthEnvironmentMaintainScope);
-    holdQueuePromotion();
-    yield* Effect.logInfo("Queue promotion held until the server restarts");
-    return HttpServerResponse.jsonUnsafe({ held: true });
-  }).pipe(
-    Effect.catchTags({
-      EnvironmentAuthInvalidError: HttpServerRespondable.toResponse,
-      EnvironmentInternalError: HttpServerRespondable.toResponse,
-      EnvironmentScopeRequiredError: HttpServerRespondable.toResponse,
-    }),
-  ),
+  (hold) => hold.hold,
+);
+export const layerReleaseQueuePromotionRoute = queuePromotionRoute(
+  RELEASE_QUEUE_PROMOTION_PATH,
+  (hold) => hold.release,
 );
 
 const UNTRACED_REQUEST_PATHS: ReadonlySet<string> = new Set([OTLP_TRACES_PROXY_PATH]);

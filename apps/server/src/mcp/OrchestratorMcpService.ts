@@ -1393,12 +1393,13 @@ const make = Effect.gen(function* () {
         `Provider ${instanceId} has no model available for inheritance.`,
       );
     }
-    // fork:model-allowlist: explicit and inherited models alike, and no skip for an empty list.
+    // fork:model-allowlist: explicit and inherited models alike, even while the list is loading.
     if (!isModelAllowed(model, provider.driver)) {
       return yield* failure("model_unavailable", `model ${model} is not allowed`);
     }
     if (
       requestedModel !== undefined &&
+      provider.models.length > 0 &&
       !provider.models.some((candidate) => candidate.slug === requestedModel)
     ) {
       return yield* failure(

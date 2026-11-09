@@ -693,8 +693,11 @@ describe("DesktopBackendConfiguration", () => {
       const previousDisabled = process.env.OTEL_SDK_DISABLED;
       const previousTelemetry = process.env.T3CODE_TELEMETRY_ENABLED;
       const previousResourceAttributes = process.env.OTEL_RESOURCE_ATTRIBUTES;
+      // fork:model-allowlist: the WSL server refuses to start without it.
+      const previousAllowedModels = process.env.T3_ALLOWED_MODELS;
       try {
         delete process.env.WSLENV;
+        process.env.T3_ALLOWED_MODELS = "gpt-6-astra,claude-opus-5-5";
         process.env.OTEL_SDK_DISABLED = "true";
         process.env.T3CODE_TELEMETRY_ENABLED = "false";
         process.env.OTEL_RESOURCE_ATTRIBUTES = "deployment.environment.name=staging";
@@ -709,6 +712,8 @@ describe("DesktopBackendConfiguration", () => {
           assert.include((config.env.WSLENV ?? "").split(":"), "T3CODE_TELEMETRY_ENABLED");
           assert.equal(config.env.OTEL_RESOURCE_ATTRIBUTES, "deployment.environment.name=staging");
           assert.include((config.env.WSLENV ?? "").split(":"), "OTEL_RESOURCE_ATTRIBUTES");
+          assert.equal(config.env.T3_ALLOWED_MODELS, "gpt-6-astra,claude-opus-5-5");
+          assert.include((config.env.WSLENV ?? "").split(":"), "T3_ALLOWED_MODELS");
         }).pipe(
           Effect.provide(
             layerBackendConfiguration().pipe(
@@ -731,6 +736,7 @@ describe("DesktopBackendConfiguration", () => {
         restoreEnv("OTEL_SDK_DISABLED", previousDisabled);
         restoreEnv("T3CODE_TELEMETRY_ENABLED", previousTelemetry);
         restoreEnv("OTEL_RESOURCE_ATTRIBUTES", previousResourceAttributes);
+        restoreEnv("T3_ALLOWED_MODELS", previousAllowedModels);
       }
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );

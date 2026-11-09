@@ -19,6 +19,7 @@ import { resolveAttachmentPath } from "../attachmentStore.ts";
 import * as ServerConfig from "../config.ts";
 import { expandHomePath } from "@t3tools/provider-core/server/pathExpansion";
 import { codexExecLaunchArgs, resolveCodexLaunchArgs } from "../provider/codexLaunchArgs.ts";
+import { CODEX_HELPERS_OFF_CONFIG } from "../provider/allowedModels.ts";
 import * as TextGenerationOperations from "@t3tools/provider-core/server/textGenerationOperations";
 import {
   normalizeCliError,
@@ -31,6 +32,11 @@ import * as HostProcess from "@t3tools/shared/HostProcess";
 const CODEX_TIMEOUT_MS = 180_000;
 const CODEX_MCP_LIST_TIMEOUT_MS = 10_000;
 // Plugins/apps add MCP servers; use trailing config overrides because --disable loses to user -c flags.
+const CODEX_HELPERS_OFF_ARGS = Object.entries(CODEX_HELPERS_OFF_CONFIG).flatMap(([key, value]) => [
+  "--config",
+  `${key}=${value}`,
+]);
+
 const CODEX_NO_PLUGIN_ARGS = [
   "--config",
   "features.plugins=false",
@@ -293,6 +299,8 @@ export const makeCodexTextGeneration = Effect.fn("makeCodexTextGeneration")(func
           "--config",
           `model_reasoning_effort="${reasoningEffort}"`,
           ...(serviceTier ? ["--config", `service_tier="${serviceTier}"`] : []),
+          // fork:model-allowlist: after the launch args, so no configured arg turns helpers back on.
+          ...CODEX_HELPERS_OFF_ARGS,
           "--output-schema",
           schemaPath,
           "--output-last-message",

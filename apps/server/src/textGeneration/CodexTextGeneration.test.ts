@@ -331,6 +331,27 @@ it.layer(layerCodexTextGenerationTest)("CodexTextGeneration", (it) => {
     ),
   );
 
+  // fork:model-allowlist
+  it.effect("keeps native helpers off after launch args that turn them on", () =>
+    withFakeCodexEnv(
+      {
+        output: JSON.stringify({ title: "Remove default shapes" }),
+        launchArgs: "--config agents.enabled=true --config features.multi_agent_v2=true",
+        requireArg:
+          "--config agents.enabled=false --config features.multi_agent_v2=false --output-schema",
+      },
+      (textGeneration) =>
+        Effect.gen(function* () {
+          const result = yield* textGeneration.generateThreadTitle({
+            cwd: process.cwd(),
+            message: "Remove default shapes from characters",
+            modelSelection: DEFAULT_TEST_MODEL_SELECTION,
+          });
+          expect(result.title).toBe("Remove default shapes");
+        }),
+    ),
+  );
+
   it.effect("passes exec-safe launch args into codex exec", () =>
     withFakeCodexEnv(
       {
@@ -638,13 +659,13 @@ it.effect("an exhausted title account falls back only to an allowed model", () =
     const { calls, title } = yield* allowlistTitleService(
       [
         { id: "codex", driver: "codex" },
-        { id: "claude_work", driver: "claudeAgent" },
+        { id: "opencode_work", driver: "opencode" },
         { id: "codex_work", driver: "codex" },
       ],
       "codex",
     );
     yield* title("gpt-6.1-sol");
-    // Claude's default title model (Haiku) is blocked, so the second Codex account runs Sol.
+    // OpenCode's default title model is blocked, so the second Codex account runs Sol.
     expect(calls).toEqual([
       { instanceId: ProviderInstanceId.make("codex_work"), model: "gpt-6.1-sol" },
     ]);
