@@ -8,6 +8,7 @@ import * as CliError from "effect/cli/CliError";
 
 import * as ServerConfig from "../config.ts";
 import { awaitLauncherLoss } from "../launcherWatch.ts";
+import { allowedModels } from "../provider/allowedModels.ts";
 import { runServer } from "../server.ts";
 import { type CliServerFlags, resolveServerConfig, sharedServerCommandFlags } from "./config.ts";
 
@@ -28,6 +29,11 @@ const runServerCommand = Effect.fn("server.runServerCommand")(function* (
     readonly rejectRunningServer?: boolean;
   },
 ) {
+  // fork:model-allowlist: never serve without the machine's model allowlist.
+  yield* Effect.try({
+    try: allowedModels,
+    catch: (cause) => new CliError.UserError({ cause, userMessage: (cause as Error).message }),
+  });
   const logLevel = yield* GlobalFlag.LogLevel;
   const config = yield* resolveServerConfig(flags, logLevel, options);
   const run = runServer.pipe(Effect.provideService(ServerConfig.ServerConfig, config));

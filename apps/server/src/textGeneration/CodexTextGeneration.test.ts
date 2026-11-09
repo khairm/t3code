@@ -6,6 +6,7 @@ import {
 } from "@t3tools/contracts";
 import type { ProviderInstance } from "@t3tools/provider-core/server/driver";
 import * as ProviderInstanceRegistry from "../provider/ProviderInstanceRegistry.ts";
+import { withProductionAllowlist } from "../provider/allowedModels.testkit.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as SourceControlProviderRegistry from "../sourceControl/SourceControlProviderRegistry.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -535,4 +536,117 @@ it.effect.each([false, true])("text generation preflight: exhausted=%s", (exhaus
         : selection,
     ]);
   }),
+);
+
+// fork:model-allowlist
+const allowlistTitleService = (
+  instanceIds: ReadonlyArray<{ readonly id: string; readonly driver: string }>,
+  exhaustedId: string | null,
+) =>
+  Effect.gen(function* () {
+    const calls: ModelSelection[] = [];
+    const instances: ProviderInstance[] = instanceIds.map(({ id, driver: kind }) => {
+      const instanceId = ProviderInstanceId.make(id);
+      const driver = ProviderDriverKind.make(kind);
+      const snapshot: ServerProvider = {
+        instanceId,
+        driver,
+        enabled: true,
+        installed: true,
+        status: "ready",
+        auth: { status: "authenticated" },
+        version: null,
+        checkedAt: "1970-01-01T00:00:00Z",
+        models: [],
+        slashCommands: [],
+        skills: [],
+        ...(id === exhaustedId
+          ? {
+              usageLimits: {
+                checkedAt: "1970-01-01T00:00:00Z",
+                windows: [{ id: "session", kind: "session", label: "Session", usedPercent: 100 }],
+              },
+            }
+          : {}),
+      };
+      return {
+        instanceId,
+        driverKind: driver,
+        continuationIdentity: { driverKind: driver, continuationKey: id },
+        displayName: undefined,
+        enabled: true,
+        snapshot: { getSnapshot: Effect.succeed(snapshot) } as ProviderInstance["snapshot"],
+        orchestrationAdapter: {} as ProviderInstance["orchestrationAdapter"],
+        textGeneration: TextGeneration.TextGeneration.of({
+          generateCommitMessage: () => Effect.die("unused"),
+          generatePrContent: () => Effect.die("unused"),
+          generateBranchName: () => Effect.die("unused"),
+          generateReviewGuide: () => Effect.die("unused"),
+          generateThreadTitle: (input) =>
+            Effect.sync(() => {
+              calls.push(input.modelSelection);
+              return { title: "Generated title" };
+            }),
+        }),
+      };
+    });
+    const service = yield* TextGeneration.make.pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          Layer.mock(ProviderInstanceRegistry.ProviderInstanceRegistry)({
+            listInstances: Effect.succeed(instances),
+            getInstance: (id) =>
+              Effect.succeed(instances.find((instance) => instance.instanceId === id)),
+          }),
+          ServerSettings.layerTest({
+            providerInstances: Object.fromEntries(
+              instanceIds.map(({ id, driver }) => [
+                id,
+                { driver: ProviderDriverKind.make(driver), config: {} },
+              ]),
+            ),
+          }),
+          Layer.mock(SourceControlProviderRegistry.SourceControlProviderRegistry)({
+            resolveLink: () => Effect.die("unused"),
+          }),
+        ),
+      ),
+    );
+    const title = (model: string) =>
+      service.generateThreadTitle({
+        cwd: "/tmp",
+        message: "hello",
+        linkedContext: "",
+        modelSelection: { instanceId: ProviderInstanceId.make(instanceIds[0]!.id), model },
+      });
+    return { calls, title };
+  });
+
+it.effect("a title job on a blocked model fails loudly instead of running it", () =>
+  Effect.gen(function* () {
+    const { calls, title } = yield* allowlistTitleService([{ id: "codex", driver: "codex" }], null);
+    const exit = yield* Effect.exit(title("gpt-6-luna"));
+    expect(Exit.isFailure(exit) && Cause.pretty(exit.cause)).toContain(
+      "Model not allowed: gpt-6-luna",
+    );
+    expect(calls).toEqual([]);
+  }).pipe(withProductionAllowlist),
+);
+
+it.effect("an exhausted title account falls back only to an allowed model", () =>
+  Effect.gen(function* () {
+    const { calls, title } = yield* allowlistTitleService(
+      [
+        { id: "codex", driver: "codex" },
+        { id: "claude_work", driver: "claudeAgent" },
+        { id: "codex_work", driver: "codex" },
+      ],
+      "codex",
+    );
+    yield* title("gpt-6.1-sol");
+    // Claude's default title model (Haiku) is blocked, so the second Codex account runs Sol.
+    expect(calls).toEqual([
+      { instanceId: ProviderInstanceId.make("codex_work"), model: "gpt-6.1-sol" },
+    ]);
+  }).pipe(withProductionAllowlist),
 );

@@ -27,7 +27,11 @@ import type {
   ServerProviderModel,
   ServerProviderSkill,
 } from "@t3tools/contracts";
-import { PREFERRED_DEFAULT_CODEX_MODELS, ServerSettingsError } from "@t3tools/contracts";
+import {
+  PREFERRED_DEFAULT_CODEX_MODELS,
+  ProviderDriverKind,
+  ServerSettingsError,
+} from "@t3tools/contracts";
 
 import {
   codexModelFamily,
@@ -36,6 +40,7 @@ import {
 } from "@t3tools/shared/model";
 import { resolveSpawnCommand } from "@t3tools/shared/shell";
 import { codexAppServerArgs, resolveCodexLaunchArgs } from "./codexLaunchArgs.ts";
+import { filterAllowedModels } from "./allowedModels.ts";
 import {
   buildServerProvider,
   COMPACT_SLASH_COMMAND,
@@ -321,7 +326,11 @@ function appendCustomCodexModels(
   customModels: ReadonlyArray<CustomModelSetting>,
 ): ReadonlyArray<ServerProviderModel> {
   const fallbackCapabilities = models.find((model) => model.capabilities)?.capabilities ?? null;
-  return providerModelsFromSettings(models, customModels, fallbackCapabilities);
+  // fork:model-allowlist
+  return filterAllowedModels(
+    providerModelsFromSettings(models, customModels, fallbackCapabilities),
+    ProviderDriverKind.make("codex"),
+  );
 }
 
 function parseCodexSkillsListResponse(

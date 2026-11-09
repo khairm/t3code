@@ -88,6 +88,13 @@ import * as ThreadLaunchService from "./ThreadLaunchService.ts";
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 
+// fork:model-allowlist
+const queuePromotionHold = vi.hoisted(() => ({ held: vi.fn(() => false) }));
+vi.mock("./QueuePromotionHold.ts", () => ({
+  holdQueuePromotion: () => undefined,
+  queuePromotionHeld: queuePromotionHold.held,
+}));
+
 const layerPlatformTest = Layer.merge(
   NodeServices.layer,
   Layer.mock(SourceControlProviderRegistry.SourceControlProviderRegistry)({
@@ -5874,6 +5881,150 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
       assert.isTrue(after.runs.find((run) => run.id === queuedRun.id)?.queueHeld);
       assert.isFalse(after.turnItems.some((item) => item.runId === queuedRun.id));
     }),
+  );
+
+  // fork:model-allowlist
+  const activeAndQueued = (threadId: ThreadId) =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        createdBy: "user",
+        creationSource: "web",
+        commandId: CommandId.make(`${threadId}:create`),
+        threadId,
+        projectId: ProjectId.make(`${threadId}:project`),
+        title: "Allowlist queue",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: process.cwd(),
+      });
+      for (const [index, text] of ["Active", "Queued"].entries()) {
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          createdBy: "user",
+          creationSource: "web",
+          commandId: CommandId.make(`${threadId}:message:${index}`),
+          threadId,
+          messageId: MessageId.make(`${threadId}:message:${index}`),
+          text,
+          attachments: [],
+          modelSelection,
+          dispatchMode: { type: index === 0 ? "start_immediately" : "queue_after_active" },
+        });
+      }
+      const { runs } = yield* orchestrator.getThreadProjection(threadId);
+      return { active: runs[0]!, queued: runs[1]! };
+    });
+
+  it.effect("holds the queue after a model_not_allowed failure", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const eventSink = yield* EventSink.EventSinkV2;
+      const threadId = ThreadId.make("runtime-layer-model-not-allowed-queue");
+      const { active, queued } = yield* activeAndQueued(threadId);
+      assert.isNotNull(active.rootNodeId);
+      const held = yield* eventSink
+        .stream({ threadId, afterSequence: yield* orchestrator.getThreadEventSequence(threadId) })
+        .pipe(
+          Stream.filter(
+            (stored) =>
+              stored.event.type === "run.updated" &&
+              stored.event.payload.id === queued.id &&
+              stored.event.payload.queueHeld === true,
+          ),
+          Stream.runHead,
+          Effect.forkScoped,
+        );
+      yield* Effect.yieldNow;
+      const now = yield* DateTime.now;
+      const base = {
+        threadId,
+        runId: active.id,
+        providerInstanceId: active.providerInstanceId,
+        occurredAt: now,
+      };
+      yield* eventSink.write({
+        events: [
+          {
+            ...base,
+            id: EventId.make(`${threadId}:error`),
+            type: "turn-item.updated",
+            nodeId: active.rootNodeId,
+            payload: {
+              id: TurnItemId.make(`${threadId}:error`),
+              type: "error",
+              threadId,
+              runId: active.id,
+              nodeId: active.rootNodeId,
+              providerThreadId: active.providerThreadId,
+              providerTurnId: null,
+              nativeItemRef: null,
+              parentItemId: null,
+              ordinal: 1,
+              status: "failed",
+              title: "Model not allowed",
+              startedAt: now,
+              completedAt: now,
+              updatedAt: now,
+              failure: {
+                class: "validation_error",
+                message: "Model not allowed: gpt-5.4",
+                code: "model_not_allowed",
+                retryable: false,
+              },
+            },
+          },
+          {
+            ...base,
+            id: EventId.make(`${threadId}:failed`),
+            type: "run.updated",
+            payload: { ...active, status: "failed", startedAt: now, completedAt: now },
+          },
+        ],
+      });
+      yield* Fiber.join(held);
+      const after = yield* orchestrator.getThreadProjection(threadId);
+      assert.equal(after.runs.find((run) => run.id === queued.id)?.status, "queued");
+    }),
+  );
+
+  it.effect("starts no queued run after a finished reply while promotion is held", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const eventSink = yield* EventSink.EventSinkV2;
+      const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+      const threadId = ThreadId.make("runtime-layer-held-promotion");
+      const { active, queued } = yield* activeAndQueued(threadId);
+      const consulted = Deferred.makeUnsafe<void>();
+      queuePromotionHold.held.mockImplementation(() => {
+        Deferred.doneUnsafe(consulted, Effect.void);
+        return true;
+      });
+      const now = yield* DateTime.now;
+      yield* eventSink.write({
+        events: [
+          {
+            id: EventId.make(`${threadId}:completed`),
+            type: "run.updated",
+            threadId,
+            runId: active.id,
+            providerInstanceId: active.providerInstanceId,
+            occurredAt: now,
+            payload: { ...active, status: "completed", startedAt: now, completedAt: now },
+          },
+        ],
+      });
+      yield* Deferred.await(consulted);
+      yield* worker.drain();
+      const after = yield* orchestrator.getThreadProjection(threadId);
+      assert.equal(after.runs.find((run) => run.id === queued.id)?.status, "queued");
+      assert.isFalse(after.turnItems.some((item) => item.runId === queued.id));
+    }).pipe(
+      Effect.ensuring(Effect.sync(() => queuePromotionHold.held.mockImplementation(() => false))),
+    ),
   );
 
   it.effect("places held queued messages after a continuation that started first", () =>

@@ -179,6 +179,8 @@ import {
 import { planThreadDeletion } from "./ThreadDeletion.ts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ServerSettings from "../serverSettings.ts";
+import { MODEL_NOT_ALLOWED_CODE } from "../provider/allowedModels.ts";
+import { queuePromotionHeld } from "./QueuePromotionHold.ts";
 
 const isMessageQuestionAnswer = Schema.is(
   Schema.Union([TrimmedNonEmptyString, Schema.NonEmptyArray(TrimmedNonEmptyString)]),
@@ -1575,10 +1577,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       }
       // Failed worktree creation would run queued work in the project checkout; wait for the user.
       const failedRun = latestExecutedRun(projection.runs);
-      const failureClass =
+      const failure =
         failedRun?.id === options?.failedRunId
-          ? latestRootProviderFailure(failedRun, projection.turnItems)?.class
-          : undefined;
+          ? latestRootProviderFailure(failedRun, projection.turnItems)
+          : null;
+      const failureClass = failure?.class;
       const worktreeMissing =
         failedRun?.id === options?.endedRunId &&
         failedRun?.workspacePreparation?.type === "worktree" &&
@@ -1601,6 +1604,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       if (
         worktreeMissing ||
         instanceDisabledForProject ||
+        // fork:model-allowlist: queued messages wait for a Move instead of each failing in turn.
+        failure?.code === MODEL_NOT_ALLOWED_CODE ||
         (failureClass !== undefined &&
           failureClass !== "validation_error" &&
           failedRun?.providerInstanceId === queuedRun.providerInstanceId)
@@ -13556,10 +13561,15 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               : Effect.void
             ).pipe(
               Effect.andThen(
-                startNextQueuedRun(threadId, {
-                  endedRunId: run.id,
-                  ...(run.status === "failed" ? { failedRunId: run.id } : {}),
-                }),
+                // fork:model-allowlist: held server-wide until the idle-gated restart.
+                Effect.suspend(() =>
+                  queuePromotionHeld()
+                    ? Effect.void
+                    : startNextQueuedRun(threadId, {
+                        endedRunId: run.id,
+                        ...(run.status === "failed" ? { failedRunId: run.id } : {}),
+                      }),
+                ),
               ),
             ),
           )

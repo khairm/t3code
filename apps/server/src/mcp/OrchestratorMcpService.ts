@@ -99,6 +99,7 @@ import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import { isSnoozed } from "../orchestration-v2/ThreadSettlementService.ts";
 import { userFacingDispatchErrorMessage } from "../orchestration-v2/UserFacingErrors.ts";
 import * as ProjectService from "../project/ProjectService.ts";
+import { filterAllowedModels, isModelAllowed } from "../provider/allowedModels.ts";
 import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
 import * as ServerSettings from "../serverSettings.ts";
@@ -1392,9 +1393,12 @@ const make = Effect.gen(function* () {
         `Provider ${instanceId} has no model available for inheritance.`,
       );
     }
+    // fork:model-allowlist: explicit and inherited models alike, and no skip for an empty list.
+    if (!isModelAllowed(model, provider.driver)) {
+      return yield* failure("model_unavailable", `model ${model} is not allowed`);
+    }
     if (
       requestedModel !== undefined &&
-      provider.models.length > 0 &&
       !provider.models.some((candidate) => candidate.slug === requestedModel)
     ) {
       return yield* failure(
@@ -2254,7 +2258,11 @@ const make = Effect.gen(function* () {
             orchestrationCapableInstanceIds.has(provider.instanceId),
           );
           const { listed, omitted } = listCapabilityModels({
-            provider,
+            // fork:model-allowlist
+            provider: {
+              ...provider,
+              models: filterAllowedModels(provider.models, provider.driver),
+            },
             preferences: settings.providerModelPreferences?.[provider.instanceId],
             searchTerms,
             isPinned: (model) =>

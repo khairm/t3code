@@ -54,6 +54,7 @@ import {
   knownProviderFailureMessage,
   makeProviderFailure,
 } from "@t3tools/provider-core/server/failure";
+import { isModelAllowed, modelNotAllowedFailure } from "../provider/allowedModels.ts";
 import * as RunExecutionService from "./RunExecutionService.ts";
 import * as RuntimePolicy from "./RuntimePolicy.ts";
 import {
@@ -538,6 +539,23 @@ export const layer: Layer.Layer<
           });
         },
       );
+      // fork:model-allowlist: every run starts here, so this is the one turn-start check.
+      // Not settleStartFailure: its provider_error would make the pilot hop and retry.
+      if (!isModelAllowed(run.modelSelection.model, providerThread.driver)) {
+        yield* settleRunBeforeStart({
+          signal: "model-not-allowed",
+          status: "failed",
+          now: yield* DateTime.now,
+          providerInstanceId: run.providerInstanceId,
+          itemProviderThreadId: providerThread.id,
+          item: {
+            type: "error",
+            title: "Model not allowed",
+            failure: modelNotAllowedFailure(run.modelSelection.model),
+          },
+        });
+        return;
+      }
       if (message.attachments.length === 0 && message.text.trimStart().startsWith("/")) {
         const isEmptyCompaction =
           message.text.trim().toLowerCase() === "/compact" && !projection.hasConversation;

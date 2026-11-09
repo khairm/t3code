@@ -1328,6 +1328,10 @@ export class CodexAppServerClientFactory extends Context.Service<
 export const CODEX_THREAD_CONFIG = {
   "tools.update_plan.enabled": true,
   mcp_optional_startup_grace_ms: 10_000,
+  // fork:model-allowlist: native helpers can't be model-checked; helpers go through delegate_task.
+  // Runtime config outranks every user, profile and project file, and multi_agent_v2 wins first.
+  "agents.enabled": false,
+  "features.multi_agent_v2": false,
 } as const;
 
 // T3 waits can block for an hour; keep Codex's MCP timeout above that.

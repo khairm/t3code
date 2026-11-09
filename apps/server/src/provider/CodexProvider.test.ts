@@ -113,16 +113,17 @@ it("uses standard routing when the catalog has no default service tier", () => {
   ]);
 });
 
+// fork:model-allowlist: the preferred defaults are allowed models only.
 it("marks the most preferred available model as default", () => {
   const models = applyPreferredCodexDefaultModel([
-    { slug: "gpt-5.6-terra", name: "GPT-5.6-Terra", isCustom: false, capabilities: null },
+    { slug: "gpt-6.1-sol", name: "GPT-6.1-Sol", isCustom: false, capabilities: null },
     { slug: "gpt-5.4", name: "GPT-5.4", isCustom: false, isDefault: true, capabilities: null },
   ]);
 
   assert.deepStrictEqual(
     models.map((model) => ({ slug: model.slug, isDefault: model.isDefault })),
     [
-      { slug: "gpt-5.6-terra", isDefault: true },
+      { slug: "gpt-6.1-sol", isDefault: true },
       { slug: "gpt-5.4", isDefault: undefined },
     ],
   );
@@ -137,17 +138,17 @@ it("ranks qualified Codex models while preserving their wire ids", () => {
       isDefault: true,
       capabilities: null,
     },
-    { slug: "openai.gpt-5.6-sol", name: "Sol", isCustom: false, capabilities: null },
+    { slug: "openai.gpt-6.1-sol", name: "Sol", isCustom: false, capabilities: null },
   ]);
   assert.deepStrictEqual(
     models.filter((model) => model.isDefault).map((model) => model.slug),
-    ["openai.gpt-5.6-sol"],
+    ["openai.gpt-6.1-sol"],
   );
 });
 
 it("ignores custom models that shadow a preferred slug", () => {
   const models = applyPreferredCodexDefaultModel([
-    { slug: "gpt-5.6-sol", name: "gpt-5.6-sol", isCustom: true, capabilities: null },
+    { slug: "gpt-6.1-sol", name: "gpt-6.1-sol", isCustom: true, capabilities: null },
     { slug: "gpt-5.4", name: "GPT-5.4", isCustom: false, isDefault: true, capabilities: null },
   ]);
 

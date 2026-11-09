@@ -127,12 +127,9 @@ const OPENCODE_DRIVER_KIND = ProviderDriverKind.make("opencode");
 export const DEFAULT_MODEL = "gpt-6-astra";
 
 /** First model present in model/list wins; otherwise use Codex's isDefault. */
-export const PREFERRED_DEFAULT_CODEX_MODELS: ReadonlyArray<string> = [
-  DEFAULT_MODEL,
-  "gpt-5.6-sol",
-  "gpt-5.6-terra",
-];
-export const DEFAULT_TEXT_GENERATION_MODEL = "gpt-6-luna";
+// fork:model-allowlist: allowed models only.
+export const PREFERRED_DEFAULT_CODEX_MODELS: ReadonlyArray<string> = [DEFAULT_MODEL, "gpt-6.1-sol"];
+export const DEFAULT_TEXT_GENERATION_MODEL = "gpt-6.1-sol";
 /** Keep the official Antigravity session's current model. Never send this ID to ACP. */
 export const ANTIGRAVITY_DEFAULT_MODEL = "antigravity-default";
 export const DEFAULT_TEXT_GENERATION_REASONING_EFFORT = "low";

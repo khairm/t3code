@@ -1,5 +1,6 @@
 import * as Mime from "effect/http/Mime";
 import {
+  AuthEnvironmentMaintainScope,
   AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
   EnvironmentHttpApi,
@@ -48,6 +49,7 @@ import {
   failEnvironmentInternal,
 } from "./auth/http.ts";
 import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
+import { holdQueuePromotion } from "./orchestration-v2/QueuePromotionHold.ts";
 import { WEBHOOK_ROUTE_PREFIX } from "./scheduledTasks/ScheduledTaskService.ts";
 import {
   browserApiCorsAllowedHeaders,
@@ -291,7 +293,10 @@ function resolveDevRedirectUrl(devUrl: URL, requestUrl: URL): string {
 const authenticateRawRouteWithScope =
   /* Request instrumentation already owns the span; keep this helper in that context. */
   Effect.fnUntraced(function* (
-    scope: typeof AuthOrchestrationReadScope | typeof AuthOrchestrationOperateScope,
+    scope:
+      | typeof AuthOrchestrationReadScope
+      | typeof AuthOrchestrationOperateScope
+      | typeof AuthEnvironmentMaintainScope,
   ) {
     const request = yield* HttpServerRequest.HttpServerRequest;
     const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
@@ -382,6 +387,26 @@ export const layerOtlpTracesProxyRoute = HttpRouter.add(
       EnvironmentScopeRequiredError: HttpServerRespondable.toResponse,
     }),
     Effect.withTracerEnabled(false),
+  ),
+);
+
+// fork:model-allowlist: the idle-gated restart calls this first, so no queued message starts
+// between its busy check and the restart. Only the restart clears it.
+const HOLD_QUEUE_PROMOTION_PATH = "/api/server/hold-queue-promotion";
+export const layerHoldQueuePromotionRoute = HttpRouter.add(
+  "POST",
+  HOLD_QUEUE_PROMOTION_PATH,
+  Effect.gen(function* () {
+    yield* authenticateRawRouteWithScope(AuthEnvironmentMaintainScope);
+    holdQueuePromotion();
+    yield* Effect.logInfo("Queue promotion held until the server restarts");
+    return HttpServerResponse.jsonUnsafe({ held: true });
+  }).pipe(
+    Effect.catchTags({
+      EnvironmentAuthInvalidError: HttpServerRespondable.toResponse,
+      EnvironmentInternalError: HttpServerRespondable.toResponse,
+      EnvironmentScopeRequiredError: HttpServerRespondable.toResponse,
+    }),
   ),
 );
 

@@ -809,7 +809,8 @@ describe("instance-scoped model selection", () => {
     );
   });
   it("falls back to the text generation default, not the chat default, for a removed model", () => {
-    const codex = provider({ instanceId: "codex", models: ["gpt-6-astra", "gpt-6-luna"] });
+    // fork:model-allowlist: the text generation default is Sol.
+    const codex = provider({ instanceId: "codex", models: ["gpt-6-astra", "gpt-6.1-sol"] });
     const providers = [
       { ...codex, models: codex.models.map((m, i) => (i === 0 ? { ...m, isDefault: true } : m)) },
     ];

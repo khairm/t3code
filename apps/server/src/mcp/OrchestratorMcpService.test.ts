@@ -55,6 +55,7 @@ import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
 import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
+import { withProductionAllowlist } from "../provider/allowedModels.testkit.ts";
 import { buildUnavailableProviderSnapshot } from "../provider/unavailableProviderSnapshot.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
@@ -1688,6 +1689,63 @@ describe("OrchestratorMcpService provider resolution", () => {
         );
       }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(layerDependencies))));
     }),
+  );
+
+  // fork:model-allowlist
+  it.effect(
+    "refuses a blocked delegate model, explicit or inherited, and lists only allowed ones",
+    () =>
+      Effect.gen(function* () {
+        const luna = { instanceId: codexInstanceId, model: "gpt-6-luna" };
+        const layerDependencies = Layer.mergeAll(
+          NodeServices.layer,
+          Layer.mock(ThreadManagementService.ThreadManagementService)({
+            hasReceipt: () => Effect.succeed(false),
+            assertProviderInstanceEnabled: () => Effect.void,
+            getThreadRecords: () => Effect.succeed(parentProjection([], luna)),
+          }),
+          ServerSettings.layerTest(),
+          providerRegistryLayer([
+            {
+              ...providerSnapshot({
+                instanceId: codexInstanceId,
+                driver: ProviderDriverKind.make("codex"),
+              }),
+              models: ["gpt-6-luna", "gpt-6.1-sol"].map((slug) => ({
+                slug,
+                name: slug,
+                isCustom: false,
+                capabilities: null,
+              })),
+            },
+          ]),
+          adapterRegistryLayer([codexInstanceId]),
+          Layer.mock(ProjectService.ProjectService)({}),
+          Layer.mock(SecretRequests.SecretRequests)({}),
+          Layer.mock(RemoteDelegation.RemoteDelegation)({}),
+          Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+        );
+
+        yield* Effect.gen(function* () {
+          const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+          for (const target of [{ providerInstanceId: codexInstanceId, model: "gpt-6-luna" }, {}]) {
+            const refused = yield* service
+              .delegateTask(scope, {
+                task: "Review the change.",
+                target: yield* decodeTarget(target),
+                mode: "async",
+              })
+              .pipe(Effect.flip);
+            assert.equal(refused.code, "model_unavailable");
+            assert.equal(refused.message, "model gpt-6-luna is not allowed");
+          }
+          const { providers } = yield* service.capabilities(scope);
+          assert.deepEqual(
+            providers[0]?.models.map((model) => model.id),
+            ["gpt-6.1-sol"],
+          );
+        }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(layerDependencies))));
+      }).pipe(withProductionAllowlist),
   );
 
   it.effect("driver-only delegation skips an instance the project turned off", () =>

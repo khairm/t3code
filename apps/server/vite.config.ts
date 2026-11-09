@@ -138,6 +138,8 @@ export default mergeConfig(
       setupFiles: [
         "./src/testUtils/gitConfig.setup.ts",
         "./src/testUtils/managedServiceEnv.setup.ts",
+        // fork:model-allowlist
+        "./src/testUtils/allowedModels.setup.ts",
       ],
       hookTimeout: 120_000,
       testTimeout: 120_000,
