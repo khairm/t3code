@@ -4,7 +4,6 @@ import * as Schema from "effect/Schema";
 import {
   EnvironmentId,
   ForwardCompatibleOptional,
-  IsoDateTime,
   ProjectId,
   ThreadId,
   TrimmedNonEmptyString,
@@ -176,9 +175,6 @@ export const ExecutionEnvironmentDescriptor = Schema.Struct({
   /** Highest migration this server's database holds; absent on older servers. */
   databaseMigration: Schema.optionalKey(Schema.Int),
   capabilities: ExecutionEnvironmentCapabilities,
-  /** fork:model-allowlist: a pending restart holds new runs; read by the Self-Hosted health. */
-  queuePromotionHeld: Schema.optionalKey(Schema.Boolean),
-  queuePromotionHeldSince: Schema.optionalKey(IsoDateTime),
 });
 export type ExecutionEnvironmentDescriptor = typeof ExecutionEnvironmentDescriptor.Type;
 

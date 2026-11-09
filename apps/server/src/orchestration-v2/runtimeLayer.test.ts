@@ -13,6 +13,7 @@ import {
   ContextTransferId,
   EventId,
   MessageId,
+  type OrchestrationV2Command,
   NodeId,
   RuntimeRequestId,
   TurnItemId,
@@ -5950,65 +5951,69 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
     Effect.flatMap(QueuePromotionHold.QueuePromotionHold, (hold) => hold.release),
   );
 
-  it.effect("holds the queue after a model_not_allowed failure", () =>
-    Effect.gen(function* () {
-      const orchestrator = yield* Orchestrator.OrchestratorV2;
-      const eventSink = yield* EventSink.EventSinkV2;
-      const threadId = ThreadId.make("runtime-layer-model-not-allowed-queue");
-      const { active, queued } = yield* activeAndQueued(threadId);
-      assert.isNotNull(active.rootNodeId);
-      const held = yield* runUpdated(threadId, queued.id, (run) => run.queueHeld === true);
-      yield* Effect.yieldNow;
-      const now = yield* DateTime.now;
-      const base = {
-        threadId,
-        runId: active.id,
-        providerInstanceId: active.providerInstanceId,
-        occurredAt: now,
-      };
-      yield* eventSink.write({
-        events: [
-          {
-            ...base,
-            id: EventId.make(`${threadId}:error`),
-            type: "turn-item.updated",
-            nodeId: active.rootNodeId,
-            payload: {
-              id: TurnItemId.make(`${threadId}:error`),
-              type: "error",
-              threadId,
-              runId: active.id,
+  it.effect.each([false, true])(
+    "holds the queue after a model_not_allowed failure (promotion held: %s)",
+    (promotionHeld) =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const eventSink = yield* EventSink.EventSinkV2;
+        const threadId = ThreadId.make(`runtime-layer-model-not-allowed-queue-${promotionHeld}`);
+        const { active, queued } = yield* activeAndQueued(threadId);
+        assert.isNotNull(active.rootNodeId);
+        if (promotionHeld)
+          yield* Effect.flatMap(QueuePromotionHold.QueuePromotionHold, (hold) => hold.hold);
+        const held = yield* runUpdated(threadId, queued.id, (run) => run.queueHeld === true);
+        yield* Effect.yieldNow;
+        const now = yield* DateTime.now;
+        const base = {
+          threadId,
+          runId: active.id,
+          providerInstanceId: active.providerInstanceId,
+          occurredAt: now,
+        };
+        yield* eventSink.write({
+          events: [
+            {
+              ...base,
+              id: EventId.make(`${threadId}:error`),
+              type: "turn-item.updated",
               nodeId: active.rootNodeId,
-              providerThreadId: active.providerThreadId,
-              providerTurnId: null,
-              nativeItemRef: null,
-              parentItemId: null,
-              ordinal: 1,
-              status: "failed",
-              title: "Model not allowed",
-              startedAt: now,
-              completedAt: now,
-              updatedAt: now,
-              failure: {
-                class: "validation_error",
-                message: "Model not allowed: gpt-5.4",
-                code: "model_not_allowed",
-                retryable: false,
+              payload: {
+                id: TurnItemId.make(`${threadId}:error`),
+                type: "error",
+                threadId,
+                runId: active.id,
+                nodeId: active.rootNodeId,
+                providerThreadId: active.providerThreadId,
+                providerTurnId: null,
+                nativeItemRef: null,
+                parentItemId: null,
+                ordinal: 1,
+                status: "failed",
+                title: "Model not allowed",
+                startedAt: now,
+                completedAt: now,
+                updatedAt: now,
+                failure: {
+                  class: "validation_error",
+                  message: "Model not allowed: gpt-5.4",
+                  code: "model_not_allowed",
+                  retryable: false,
+                },
               },
             },
-          },
-          {
-            ...base,
-            id: EventId.make(`${threadId}:failed`),
-            type: "run.updated",
-            payload: { ...active, status: "failed", startedAt: now, completedAt: now },
-          },
-        ],
-      });
-      yield* Fiber.join(held);
-      const after = yield* orchestrator.getThreadProjection(threadId);
-      assert.equal(after.runs.find((run) => run.id === queued.id)?.status, "queued");
-    }),
+            {
+              ...base,
+              id: EventId.make(`${threadId}:failed`),
+              type: "run.updated",
+              payload: { ...active, status: "failed", startedAt: now, completedAt: now },
+            },
+          ],
+        });
+        yield* Fiber.join(held);
+        const after = yield* orchestrator.getThreadProjection(threadId);
+        assert.equal(after.runs.find((run) => run.id === queued.id)?.status, "queued");
+      }).pipe(releaseHold),
   );
 
   it.effect("starts no queued run while promotion is held, and starts it on release", () =>
@@ -6075,33 +6080,166 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
     }).pipe(releaseHold),
   );
 
-  it.effect("queues a server-created message on an idle thread while promotion is held", () =>
+  /** A message in `threadId`; `overrides` say who sent it and how it starts. */
+  const messageCommand = (
+    threadId: ThreadId,
+    suffix: string,
+    overrides: Partial<Extract<OrchestrationV2Command, { readonly type: "message.dispatch" }>> = {},
+  ) => ({
+    type: "message.dispatch" as const,
+    createdBy: "user" as const,
+    creationSource: "web" as const,
+    commandId: CommandId.make(`${threadId}:${suffix}`),
+    threadId,
+    messageId: MessageId.make(`${threadId}:${suffix}`),
+    text: suffix,
+    attachments: [],
+    modelSelection,
+    dispatchMode: { type: "start_immediately" as const },
+    ...overrides,
+  });
+  /** Creates `threadId`, sends it one message, and returns the run that made. */
+  const firstRun = (
+    threadId: ThreadId,
+    suffix: string,
+    overrides?: Parameters<typeof messageCommand>[2],
+  ) =>
     Effect.gen(function* () {
       const orchestrator = yield* Orchestrator.OrchestratorV2;
-      const hold = yield* QueuePromotionHold.QueuePromotionHold;
-      const threadId = ThreadId.make("runtime-layer-held-server-message");
       yield* createThread(threadId);
-      yield* hold.hold;
-      yield* orchestrator.dispatch({
-        type: "message.dispatch",
-        createdBy: "agent",
-        creationSource: "server",
-        commandId: CommandId.make(`${threadId}:wake`),
-        threadId,
-        messageId: MessageId.make(`${threadId}:wake`),
-        text: "Helper result",
-        attachments: [],
-        modelSelection,
-        dispatchMode: { type: "start_immediately" },
-      });
-      const [run] = (yield* orchestrator.getThreadProjection(threadId)).runs;
-      assert.equal(run?.status, "queued");
-      assert.notEqual(run?.queueHeld, true);
+      yield* orchestrator.dispatch(messageCommand(threadId, suffix, overrides));
+      return (yield* orchestrator.getThreadProjection(threadId)).runs[0]!;
+    });
+  const serverWake = { createdBy: "agent", creationSource: "server" } as const;
 
-      const started = yield* runUpdated(threadId, run!.id, (run) => run.status === "starting");
+  it.effect(
+    "queues a server-created message while promotion is held; recovery leaves it to start",
+    () =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const recovery = yield* ProviderRuntimeRecoveryService.ProviderRuntimeRecoveryService;
+        const hold = yield* QueuePromotionHold.QueuePromotionHold;
+        const threadId = ThreadId.make("runtime-layer-held-server-message");
+        yield* hold.hold;
+        const run = yield* firstRun(threadId, "wake", serverWake);
+        assert.equal(run.status, "queued");
+        assert.isTrue(run.heldForRestart);
+        assert.notEqual(run.queueHeld, true);
+        // The restart's recovery holds queued messages for the user, but not this one.
+        yield* recovery.reconcile("startup");
+        const [recovered] = (yield* orchestrator.getThreadProjection(threadId)).runs;
+        assert.equal(recovered?.status, "queued");
+        assert.notEqual(recovered?.queueHeld, true);
+
+        const started = yield* runUpdated(threadId, run.id, (run) => run.status === "starting");
+        yield* Effect.yieldNow;
+        yield* hold.release;
+        yield* Fiber.join(started);
+        const [promoted] = (yield* orchestrator.getThreadProjection(threadId)).runs;
+        assert.notEqual(promoted?.heldForRestart, true);
+      }).pipe(releaseHold),
+  );
+
+  it.effect(
+    "while draining, starts a message its still-active sender caused; holds one from an idle sender",
+    () =>
+      Effect.gen(function* () {
+        const hold = yield* QueuePromotionHold.QueuePromotionHold;
+        const busySenderId = ThreadId.make("runtime-layer-held-busy-sender");
+        const idleSenderId = ThreadId.make("runtime-layer-held-idle-sender");
+        yield* activeAndQueued(busySenderId);
+        yield* createThread(idleSenderId);
+        yield* hold.hold;
+        const delegateFrom = (senderThreadId: ThreadId, threadId: ThreadId) =>
+          firstRun(threadId, "delegate", {
+            createdBy: "agent",
+            creationSource: "mcp",
+            senderThreadId,
+          });
+        const fromBusy = yield* delegateFrom(
+          busySenderId,
+          ThreadId.make("runtime-layer-held-child-busy"),
+        );
+        assert.equal(fromBusy.status, "starting");
+        const fromIdle = yield* delegateFrom(
+          idleSenderId,
+          ThreadId.make("runtime-layer-held-child-idle"),
+        );
+        assert.equal(fromIdle.status, "queued");
+        assert.isTrue(fromIdle.heldForRestart);
+      }).pipe(releaseHold),
+  );
+
+  it.effect("holds a prepared launch at its release, and starts it once released", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+      const hold = yield* QueuePromotionHold.QueuePromotionHold;
+      const threadId = ThreadId.make("runtime-layer-held-prepared-launch");
+      yield* hold.hold;
+      const preparing = yield* firstRun(threadId, "launch", {
+        creationSource: "server",
+        dispatchMode: { type: "defer_start", workspaceStrategy: { type: "root" } },
+      });
+      assert.equal(preparing.status, "preparing");
+      yield* orchestrator.dispatch({
+        type: "prepared-run.release",
+        commandId: CommandId.make(`${threadId}:release`),
+        threadId,
+        runId: preparing.id,
+      });
+      yield* worker.drain();
+      const [queued] = (yield* orchestrator.getThreadProjection(threadId)).runs;
+      assert.equal(queued?.status, "queued");
+      assert.isTrue(queued?.heldForRestart);
+
+      const started = yield* runUpdated(threadId, preparing.id, (run) => run.status === "starting");
       yield* Effect.yieldNow;
       yield* hold.release;
       yield* Fiber.join(started);
+    }).pipe(releaseHold),
+  );
+
+  it.effect("starts a client send while draining, and queues one during the cutover", () =>
+    Effect.gen(function* () {
+      const hold = yield* QueuePromotionHold.QueuePromotionHold;
+      const draining = yield* hold.hold;
+      const sent = yield* firstRun(ThreadId.make("runtime-layer-drain-client-send"), "send");
+      assert.equal(sent.status, "starting");
+      yield* hold.cutover(draining.generation);
+      const held = yield* firstRun(ThreadId.make("runtime-layer-cutover-client-send"), "send");
+      assert.equal(held.status, "queued");
+      assert.isTrue(held.heldForRestart);
+    }).pipe(releaseHold),
+  );
+
+  it.effect("refuses a server message a pending fork cannot queue, leaving no receipt behind", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const hold = yield* QueuePromotionHold.QueuePromotionHold;
+      const sourceId = ThreadId.make("runtime-layer-held-fork-source");
+      const forkId = ThreadId.make("runtime-layer-held-fork-target");
+      yield* createThread(sourceId);
+      yield* orchestrator.dispatch({
+        type: "thread.fork",
+        commandId: CommandId.make(`${forkId}:fork`),
+        sourceThreadId: sourceId,
+        targetThreadId: forkId,
+        sourcePoint: { type: "latest_stable" },
+        sideChat: true,
+        createdBy: "user",
+        creationSource: "web",
+      });
+      yield* hold.hold;
+      const wake = messageCommand(forkId, "wake", serverWake);
+      const refused = yield* orchestrator.dispatch(wake).pipe(Effect.flip);
+      assert.equal(
+        userFacingDispatchErrorMessage(refused),
+        QueuePromotionHold.QUEUE_PROMOTION_HELD_MESSAGE,
+      );
+      yield* hold.release;
+      yield* orchestrator.dispatch(wake);
+      assert.equal((yield* orchestrator.getThreadProjection(forkId)).runs[0]?.status, "starting");
     }).pipe(releaseHold),
   );
 

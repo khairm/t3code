@@ -317,27 +317,16 @@ const authenticateRawRouteWithScope =
     }
   });
 
-// fork:model-allowlist
-const queuePromotionHealth = (heldSince: DateTime.Utc | null) => ({
-  queuePromotionHeld: heldSince !== null,
-  ...(heldSince === null ? {} : { queuePromotionHeldSince: DateTime.formatIso(heldSince) }),
-});
-
 export const layerServerEnvironmentHttpApi = HttpApiBuilder.group(
   EnvironmentHttpApi,
   "metadata",
   Effect.fnUntraced(function* (handlers) {
     const serverEnvironment = yield* ServerEnvironment.ServerEnvironment;
-    const promotionHold = yield* QueuePromotionHold.QueuePromotionHold;
     return handlers.handle(
       "descriptor",
       Effect.fn("environment.metadata.descriptor")(function* (args) {
         yield* annotateEnvironmentRequest(args.endpoint.name);
-        return {
-          ...(yield* serverEnvironment.getDescriptor),
-          // fork:model-allowlist: read by the Self-Hosted health endpoint.
-          ...queuePromotionHealth(yield* promotionHold.heldSince),
-        };
+        return yield* serverEnvironment.getDescriptor;
       }, traceRelayRequest),
     );
   }),
@@ -402,37 +391,87 @@ export const layerOtlpTracesProxyRoute = HttpRouter.add(
   ),
 );
 
-// fork:model-allowlist: the idle-gated restart holds new runs before its busy check; the
-// restart, the release route or a 30-minute expiry clears the hold.
+// fork:model-allowlist: the idle-gated restart holds new runs (drain), asks for the cutover once
+// no run is busy, then restarts. The restart, the release route or the expiry clears the hold.
 export const HOLD_QUEUE_PROMOTION_PATH = "/api/server/hold-queue-promotion";
 export const RELEASE_QUEUE_PROMOTION_PATH = "/api/server/release-queue-promotion";
+const QueuePromotionHoldRequest = Schema.Union([
+  Schema.Struct({ phase: Schema.optional(Schema.Literal("drain")) }),
+  Schema.Struct({ phase: Schema.Literal("cutover"), generation: Schema.Int }),
+]);
+const decodeQueuePromotionHoldRequest = Schema.decodeEffect(
+  Schema.fromJsonString(QueuePromotionHoldRequest),
+);
+
+const queuePromotionStatusJson = (status: QueuePromotionHold.QueuePromotionHoldStatus) =>
+  HttpServerResponse.jsonUnsafe(
+    status.held
+      ? {
+          ...status,
+          heldSince: DateTime.formatIso(status.heldSince),
+          expiresAt: DateTime.formatIso(status.expiresAt),
+        }
+      : status,
+  );
+const queuePromotionErrorJson = (status: number, error: string, message: string) =>
+  HttpServerResponse.jsonUnsafe({ error, message }, { status });
+
 const queuePromotionRoute = (
+  method: "GET" | "POST",
   path: HttpRouter.PathInput,
-  change: (hold: QueuePromotionHold.QueuePromotionHoldShape) => Effect.Effect<void>,
+  handle: (
+    hold: QueuePromotionHold.QueuePromotionHoldShape,
+  ) => Effect.Effect<
+    HttpServerResponse.HttpServerResponse,
+    | QueuePromotionHold.QueuePromotionHoldLockWaitError
+    | QueuePromotionHold.QueuePromotionHoldStaleError
+    | Schema.SchemaError,
+    HttpServerRequest.HttpServerRequest
+  >,
 ) =>
   HttpRouter.add(
-    "POST",
+    method,
     path,
     Effect.gen(function* () {
       yield* authenticateRawRouteWithScope(AuthEnvironmentMaintainScope);
-      const hold = yield* QueuePromotionHold.QueuePromotionHold;
-      yield* change(hold);
-      return HttpServerResponse.jsonUnsafe(queuePromotionHealth(yield* hold.heldSince));
+      return yield* handle(yield* QueuePromotionHold.QueuePromotionHold);
     }).pipe(
       Effect.catchTags({
         EnvironmentAuthInvalidError: HttpServerRespondable.toResponse,
         EnvironmentInternalError: HttpServerRespondable.toResponse,
         EnvironmentScopeRequiredError: HttpServerRespondable.toResponse,
+        QueuePromotionHoldLockWaitError: (error) =>
+          Effect.succeed(queuePromotionErrorJson(503, "lock_wait_timeout", error.message)),
+        QueuePromotionHoldStaleError: (error) =>
+          Effect.succeed(queuePromotionErrorJson(409, "stale_generation", error.message)),
+        SchemaError: (error) =>
+          Effect.succeed(queuePromotionErrorJson(400, "invalid_request", error.message)),
       }),
     ),
   );
+
+/** `{}` or `{"phase":"drain"}` sets or refreshes the drain; `{"phase":"cutover","generation":n}` moves that hold to cutover. */
 export const layerHoldQueuePromotionRoute = queuePromotionRoute(
+  "POST",
   HOLD_QUEUE_PROMOTION_PATH,
-  (hold) => hold.hold,
+  Effect.fnUntraced(function* (hold) {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const text = yield* request.text.pipe(Effect.orDie);
+    const body = yield* decodeQueuePromotionHoldRequest(text.trim() === "" ? "{}" : text);
+    return queuePromotionStatusJson(
+      yield* body.phase === "cutover" ? hold.cutover(body.generation) : hold.hold,
+    );
+  }),
 );
 export const layerReleaseQueuePromotionRoute = queuePromotionRoute(
+  "POST",
   RELEASE_QUEUE_PROMOTION_PATH,
-  (hold) => hold.release,
+  (hold) => Effect.andThen(hold.release, Effect.map(hold.status, queuePromotionStatusJson)),
+);
+export const layerQueuePromotionStatusRoute = queuePromotionRoute(
+  "GET",
+  HOLD_QUEUE_PROMOTION_PATH,
+  (hold) => Effect.map(hold.status, queuePromotionStatusJson),
 );
 
 const UNTRACED_REQUEST_PATHS: ReadonlySet<string> = new Set([OTLP_TRACES_PROXY_PATH]);

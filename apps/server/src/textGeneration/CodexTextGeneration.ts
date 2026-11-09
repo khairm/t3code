@@ -31,12 +31,13 @@ import * as HostProcess from "@t3tools/shared/HostProcess";
 
 const CODEX_TIMEOUT_MS = 180_000;
 const CODEX_MCP_LIST_TIMEOUT_MS = 10_000;
-// Plugins/apps add MCP servers; use trailing config overrides because --disable loses to user -c flags.
+// fork:model-allowlist
 const CODEX_HELPERS_OFF_ARGS = Object.entries(CODEX_HELPERS_OFF_CONFIG).flatMap(([key, value]) => [
   "--config",
   `${key}=${value}`,
 ]);
 
+// Plugins/apps add MCP servers; use trailing config overrides because --disable loses to user -c flags.
 const CODEX_NO_PLUGIN_ARGS = [
   "--config",
   "features.plugins=false",

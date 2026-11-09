@@ -883,14 +883,17 @@ describe("queue promotion hold routes", () => {
       });
     },
   });
+  const HOLD = ServerHttp.HOLD_QUEUE_PROMOTION_PATH;
+  const RELEASE = ServerHttp.RELEASE_QUEUE_PROMOTION_PATH;
   const serveHoldRoutes = Effect.fn("serveHoldRoutes")(function* (
     layerThreadLocks: Layer.Layer<ThreadCommandExecutor.ThreadCommandExecutor> = ThreadCommandExecutor.layer,
   ) {
     const services = yield* Layer.build(
       HttpRouter.serve(
-        Layer.merge(
+        Layer.mergeAll(
           ServerHttp.layerHoldQueuePromotionRoute,
           ServerHttp.layerReleaseQueuePromotionRoute,
+          ServerHttp.layerQueuePromotionStatusRoute,
         ),
         { disableListenLog: true, disableLogger: true },
       ).pipe(
@@ -901,80 +904,170 @@ describe("queue promotion hold routes", () => {
       ),
     );
     const client = Context.get(services, HttpClient.HttpClient);
-    const post = (path: string, token?: string) =>
-      client.execute(
-        HttpClientRequest.post(path).pipe(
-          token === undefined ? (request) => request : HttpClientRequest.bearerToken(token),
-        ),
+    /** A string body is sent as given; an object is sent as JSON. */
+    const request = Effect.fn("request")(function* (
+      method: "GET" | "POST",
+      path: string,
+      token?: string,
+      body?: string | Record<string, unknown>,
+    ) {
+      const base = method === "GET" ? HttpClientRequest.get(path) : HttpClientRequest.post(path);
+      const withBody =
+        body === undefined
+          ? base
+          : typeof body === "string"
+            ? HttpClientRequest.bodyText(base, body, "application/json")
+            : yield* HttpClientRequest.bodyJson(base, body);
+      const response = yield* client.execute(
+        token === undefined ? withBody : HttpClientRequest.bearerToken(withBody, token),
       );
+      return {
+        status: response.status,
+        body: (yield* response.json) as Record<string, unknown>,
+      };
+    });
     return {
-      post,
+      request,
       hold: Context.get(services, QueuePromotionHold.QueuePromotionHold),
       threadLocks: Context.get(services, ThreadCommandExecutor.ThreadCommandExecutor),
     };
   });
-  const paths = [ServerHttp.HOLD_QUEUE_PROMOTION_PATH, ServerHttp.RELEASE_QUEUE_PROMOTION_PATH];
 
   it.effect("refuses a missing credential and a session without environment:maintain", () =>
     Effect.gen(function* () {
-      const { post, hold } = yield* serveHoldRoutes();
-      for (const path of paths) {
-        expect((yield* post(path)).status).toBe(401);
-        expect((yield* post(path, "read")).status).toBe(403);
+      const { request, hold } = yield* serveHoldRoutes();
+      for (const [method, path] of [
+        ["POST", HOLD],
+        ["POST", RELEASE],
+        ["GET", HOLD],
+      ] as const) {
+        expect((yield* request(method, path)).status).toBe(401);
+        expect((yield* request(method, path, "read")).status).toBe(403);
       }
-      expect(yield* hold.heldSince).toBeNull();
+      expect((yield* hold.status).held).toBe(false);
     }).pipe(Effect.provide(NodeServices.layer)),
   );
 
-  it.effect("holds, reports since when, and releases", () =>
+  it.effect(
+    "holds, refreshes keeping heldSince, reports, and releases to the next generation",
+    () =>
+      Effect.gen(function* () {
+        const { request } = yield* serveHoldRoutes();
+        const held = yield* request("POST", HOLD, "maintain");
+        expect(held.status).toBe(200);
+        expect(held.body).toMatchObject({ held: true, phase: "drain", generation: 0 });
+        const { heldSince, expiresAt } = held.body;
+        expect(typeof heldSince).toBe("string");
+
+        yield* TestClock.adjust("10 minutes");
+        const refreshed = yield* request("POST", HOLD, "maintain", { phase: "drain" });
+        expect(refreshed.body).toMatchObject({
+          held: true,
+          phase: "drain",
+          generation: 0,
+          heldSince,
+        });
+        expect(
+          Date.parse(refreshed.body.expiresAt as string) - Date.parse(expiresAt as string),
+        ).toBe(10 * 60_000);
+        expect((yield* request("GET", HOLD, "maintain")).body).toEqual(refreshed.body);
+
+        expect((yield* request("POST", RELEASE, "maintain")).body).toEqual({
+          held: false,
+          generation: 1,
+        });
+        expect((yield* request("GET", HOLD, "maintain")).body).toEqual({
+          held: false,
+          generation: 1,
+        });
+      }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("moves the hold to cutover only for its own generation", () =>
     Effect.gen(function* () {
-      const { post, hold } = yield* serveHoldRoutes();
-      const held = yield* post(ServerHttp.HOLD_QUEUE_PROMOTION_PATH, "maintain");
-      expect(held.status).toBe(200);
-      const heldBody = (yield* held.json) as Record<string, unknown>;
-      expect(heldBody.queuePromotionHeld).toBe(true);
-      expect(typeof heldBody.queuePromotionHeldSince).toBe("string");
-      expect(yield* hold.heldSince).not.toBeNull();
+      const { request } = yield* serveHoldRoutes();
+      const cutover = (generation: number) =>
+        request("POST", HOLD, "maintain", { phase: "cutover", generation });
+      const unheld = yield* cutover(0);
+      expect(unheld.status).toBe(409);
+      expect(unheld.body.error).toBe("stale_generation");
 
-      const released = yield* post(ServerHttp.RELEASE_QUEUE_PROMOTION_PATH, "maintain");
-      expect(released.status).toBe(200);
-      expect(yield* released.json).toEqual({ queuePromotionHeld: false });
-      expect(yield* hold.heldSince).toBeNull();
+      yield* request("POST", HOLD, "maintain");
+      yield* request("POST", RELEASE, "maintain");
+      yield* request("POST", HOLD, "maintain");
+      expect((yield* cutover(0)).status).toBe(409);
+      expect((yield* request("GET", HOLD, "maintain")).body).toMatchObject({
+        phase: "drain",
+        generation: 1,
+      });
+      const current = yield* cutover(1);
+      expect(current.status).toBe(200);
+      expect(current.body).toMatchObject({ held: true, phase: "cutover", generation: 1 });
+
+      const unnamed = yield* request("POST", HOLD, "maintain", { phase: "cutover" });
+      expect(unnamed.status).toBe(400);
+      expect((yield* request("POST", HOLD, "maintain", "not json")).status).toBe(400);
+      expect((yield* request("GET", HOLD, "maintain")).body).toMatchObject({ phase: "cutover" });
     }).pipe(Effect.provide(NodeServices.layer)),
   );
+
+  it.effect("expires 30 minutes after the last refresh, so a late cutover is refused", () =>
+    Effect.gen(function* () {
+      const { request, hold } = yield* serveHoldRoutes();
+      const released = yield* hold.releases.pipe(Stream.runHead, Effect.forkScoped);
+      yield* Effect.yieldNow;
+      yield* request("POST", HOLD, "maintain");
+      yield* TestClock.adjust("20 minutes");
+      yield* request("POST", HOLD, "maintain");
+      yield* TestClock.adjust("29 minutes");
+      expect((yield* hold.status).held).toBe(true);
+      yield* TestClock.adjust("1 minute");
+      yield* Fiber.join(released);
+      expect(yield* hold.status).toEqual({ held: false, generation: 1 });
+      const late = yield* request("POST", HOLD, "maintain", { phase: "cutover", generation: 0 });
+      expect(late.status).toBe(409);
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  /** Signals once the hold waits on a thread lock: the second lock taken after the in-flight decision's. */
+  const layerSpyLocks = (holdWaiting: Deferred.Deferred<void>) => {
+    let lockUsers = 0;
+    return Layer.effect(
+      ThreadCommandExecutor.ThreadCommandExecutor,
+      Effect.map(KeyedLock.make<ThreadId>(), (locks) => ({
+        ...locks,
+        withLock: <A, E, R>(threadId: ThreadId, effect: Effect.Effect<A, E, R>) =>
+          Effect.suspend(() =>
+            (++lockUsers === 2 ? Deferred.succeed(holdWaiting, undefined) : Effect.void).pipe(
+              Effect.andThen(locks.withLock(threadId, effect)),
+            ),
+          ),
+      })),
+    );
+  };
+
+  /** A hold request forked while a start decision holds its thread lock; `commit` lets the decision finish. */
+  const holdBehindStuckDecision = Effect.gen(function* () {
+    const holdWaiting = yield* Deferred.make<void>();
+    const { request, hold, threadLocks } = yield* serveHoldRoutes(layerSpyLocks(holdWaiting));
+    const decisionStarted = yield* Deferred.make<void>();
+    const commit = yield* Deferred.make<void>();
+    const decision = yield* threadLocks
+      .withLock(
+        ThreadId.make("thread-in-flight"),
+        Deferred.succeed(decisionStarted, undefined).pipe(Effect.andThen(Deferred.await(commit))),
+      )
+      .pipe(Effect.forkScoped);
+    yield* Deferred.await(decisionStarted);
+    const reply = yield* request("POST", HOLD, "maintain").pipe(Effect.forkScoped);
+    yield* Deferred.await(holdWaiting);
+    expect((yield* hold.status).held).toBe(true);
+    return { reply, decision, commit };
+  });
 
   it.effect("replies to a hold only once a start decision already under way has committed", () =>
     Effect.gen(function* () {
-      // The second lock taken is the hold waiting for the decision's thread.
-      const drainReached = yield* Deferred.make<void>();
-      let lockUsers = 0;
-      const layerSpyLocks = Layer.effect(
-        ThreadCommandExecutor.ThreadCommandExecutor,
-        Effect.map(KeyedLock.make<ThreadId>(), (locks) => ({
-          ...locks,
-          withLock: <A, E, R>(threadId: ThreadId, effect: Effect.Effect<A, E, R>) =>
-            Effect.suspend(() =>
-              (++lockUsers === 2 ? Deferred.succeed(drainReached, undefined) : Effect.void).pipe(
-                Effect.andThen(locks.withLock(threadId, effect)),
-              ),
-            ),
-        })),
-      );
-      const { post, hold, threadLocks } = yield* serveHoldRoutes(layerSpyLocks);
-      const decisionStarted = yield* Deferred.make<void>();
-      const commit = yield* Deferred.make<void>();
-      const decision = yield* threadLocks
-        .withLock(
-          ThreadId.make("thread-in-flight"),
-          Deferred.succeed(decisionStarted, undefined).pipe(Effect.andThen(Deferred.await(commit))),
-        )
-        .pipe(Effect.forkScoped);
-      yield* Deferred.await(decisionStarted);
-      const reply = yield* post(ServerHttp.HOLD_QUEUE_PROMOTION_PATH, "maintain").pipe(
-        Effect.forkScoped,
-      );
-      yield* Deferred.await(drainReached);
-      expect(yield* hold.heldSince).not.toBeNull();
+      const { reply, decision, commit } = yield* holdBehindStuckDecision;
       expect(reply.pollUnsafe()).toBeUndefined();
       yield* Deferred.succeed(commit, undefined);
       yield* Fiber.join(decision);
@@ -982,17 +1075,16 @@ describe("queue promotion hold routes", () => {
     }).pipe(Effect.provide(NodeServices.layer)),
   );
 
-  it.effect("releases itself after 30 minutes without a restart", () =>
-    Effect.gen(function* () {
-      const { post, hold } = yield* serveHoldRoutes();
-      const released = yield* hold.releases.pipe(Stream.runHead, Effect.forkScoped);
-      yield* Effect.yieldNow;
-      expect((yield* post(ServerHttp.HOLD_QUEUE_PROMOTION_PATH, "maintain")).status).toBe(200);
-      yield* TestClock.adjust("29 minutes");
-      expect(yield* hold.heldSince).not.toBeNull();
-      yield* TestClock.adjust("1 minute");
-      yield* Fiber.join(released);
-      expect(yield* hold.heldSince).toBeNull();
-    }).pipe(Effect.provide(NodeServices.layer)),
+  it.effect(
+    "answers with a clear error when an earlier decision has not committed in 20 seconds",
+    () =>
+      Effect.gen(function* () {
+        const { reply, commit } = yield* holdBehindStuckDecision;
+        yield* TestClock.adjust("20 seconds");
+        const timedOut = yield* Fiber.join(reply);
+        expect(timedOut.status).toBe(503);
+        expect(timedOut.body.error).toBe("lock_wait_timeout");
+        yield* Deferred.succeed(commit, undefined);
+      }).pipe(Effect.provide(NodeServices.layer)),
   );
 });

@@ -563,6 +563,14 @@ const make = Effect.fn("serverRuntimeStartup.make")(function* (options?: Startup
       ).pipe(Effect.map((targets): AutoBootstrapWelcomeTargets => targets)),
     });
     yield* Effect.logInfo("V2 orchestration recovery completed", recovery);
+    // fork:model-allowlist: runs the restart hold queued, after activation like the pull below;
+    // recovery has already held every other queued run for the user.
+    yield* runStartupPhase("orchestration-v2.held-runs.resume", orchestrator.resumeQueuedRuns).pipe(
+      Effect.catch((cause) =>
+        Effect.logError("Failed to start the runs held for the restart", { cause }),
+      ),
+      forkParked,
+    );
     // Runs after activation: the status check fetches every enabled project's
     // remote, and awaiting it here held command readiness for that long.
     yield* runStartupPhase(

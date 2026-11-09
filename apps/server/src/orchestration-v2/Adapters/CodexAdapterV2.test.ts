@@ -71,6 +71,7 @@ import type * as ProviderContinuationRequests from "@t3tools/provider-core/serve
 import * as ModelManifest from "../../provider/ModelManifest.ts";
 import { resolveProviderCompatibility } from "../../provider/providerCompatibility.ts";
 import * as CodexAdapterV2 from "./CodexAdapterV2.ts";
+import { CODEX_HELPERS_OFF_CONFIG } from "../../provider/allowedModels.ts";
 import { withProductionAllowlist } from "../../provider/allowedModels.testkit.ts";
 import { withCodexReplayChildMetadata } from "./CodexAdapterV2.testkit.ts";
 import * as CodexAdapterV2Testkit from "./CodexAdapterV2.testkit.ts";
@@ -1547,11 +1548,19 @@ describe("CodexAdapterV2 post-settle continuation", () => {
           http_headers: { Authorization: "Bearer current-token" },
         },
         "mcp_servers.extra.command": "cat",
+        // fork:model-allowlist: every thread sends these; the recordings predate them.
+        ...CODEX_HELPERS_OFF_CONFIG,
       };
-      for (const recordedMcp of [
-        { mcp_servers: { "t3-code": recordedServer } },
-        { "mcp_servers.t3-code": recordedServer, "mcp_servers.extra.command": "echo" },
-      ]) {
+      for (const [recordedMcp, drift] of [
+        [{ mcp_servers: { "t3-code": recordedServer } }, { "tools.update_plan.enabled": false }],
+        [
+          { "mcp_servers.t3-code": recordedServer, "mcp_servers.extra.command": "echo" },
+          { "tools.update_plan.enabled": false },
+        ],
+        // A request that turns helpers back on mismatches a recording that never named them.
+        [{ mcp_servers: { "t3-code": recordedServer } }, { "agents.enabled": true }],
+        [{ mcp_servers: { "t3-code": recordedServer } }, { "features.multi_agent_v2": true }],
+      ] as const) {
         const entries = codexReplayPreamble({
           nativeThreadId: "replayed-mcp-thread",
           nativeTurnId: "unused",
@@ -1587,9 +1596,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
           assert.equal(response.thread.id, "replayed-mcp-thread");
           assert.isNull((yield* Ref.get(driver.state)).failure);
           yield* client
-            .request("thread/start", {
-              config: { ...currentConfig, "tools.update_plan.enabled": false },
-            })
+            .request("thread/start", { config: { ...currentConfig, ...drift } })
             .pipe(Effect.flip);
           assert.instanceOf(
             (yield* Ref.get(driver.state)).failure,
@@ -2468,7 +2475,12 @@ describe("CodexAdapterV2 post-settle continuation", () => {
                 params: {
                   threadId: nativeThreadId,
                   excludeTurns: true,
-                  config: CodexAdapterV2.CODEX_THREAD_CONFIG,
+                  // fork:model-allowlist: helpers stay off on a resume.
+                  config: {
+                    ...CodexAdapterV2.CODEX_THREAD_CONFIG,
+                    "agents.enabled": false,
+                    "features.multi_agent_v2": false,
+                  },
                 },
               },
             },
@@ -7378,7 +7390,15 @@ describe("CodexAdapterV2 post-settle continuation", () => {
               frame: {
                 id: 3,
                 method: "thread/fork",
-                params: { threadId: nativeThreadId, config: CodexAdapterV2.CODEX_THREAD_CONFIG },
+                params: {
+                  threadId: nativeThreadId,
+                  // fork:model-allowlist: helpers stay off on a fork.
+                  config: {
+                    ...CodexAdapterV2.CODEX_THREAD_CONFIG,
+                    "agents.enabled": false,
+                    "features.multi_agent_v2": false,
+                  },
+                },
               },
             },
             {

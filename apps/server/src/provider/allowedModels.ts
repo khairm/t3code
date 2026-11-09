@@ -20,18 +20,31 @@ export const CODEX_HELPERS_OFF_CONFIG = {
   "features.multi_agent_v2": false,
 } as const;
 
-/** Throws when T3_ALLOWED_MODELS is missing, empty or has an empty entry. */
+/** A canonical slug: what `allowlistSlug` produces, so an entry can match. */
+const CANONICAL_MODEL_SLUG = /^(claude|gpt)-[a-z0-9][a-z0-9.-]*$/;
+
+let parsed: { readonly raw: string; readonly slugs: ReadonlySet<string> } | undefined;
+
+/** Throws when T3_ALLOWED_MODELS is missing, empty, or has an entry that is not a canonical slug. */
 export function allowedModels(): ReadonlySet<string> | "any" {
   const testOverride = allowedModelsTestOverride();
   if (testOverride !== undefined) return testOverride;
   const raw = process.env[ALLOWED_MODELS_ENV]?.trim() ?? "";
+  if (parsed?.raw === raw) return parsed.slugs;
   const slugs = raw.split(",").map((slug) => slug.trim());
   if (raw === "" || slugs.includes("")) {
     throw new Error(
       `${ALLOWED_MODELS_ENV} must list the model slugs this machine may run, comma-separated; got ${JSON.stringify(process.env[ALLOWED_MODELS_ENV] ?? null)}.`,
     );
   }
-  return new Set(slugs);
+  const invalid = slugs.find((slug) => !CANONICAL_MODEL_SLUG.test(slug));
+  if (invalid !== undefined) {
+    throw new Error(
+      `${ALLOWED_MODELS_ENV} entry ${JSON.stringify(invalid)} is not a canonical model slug: lowercase, a claude- or gpt- prefix, no [1m] or other suffix.`,
+    );
+  }
+  parsed = { raw, slugs: new Set(slugs) };
+  return parsed.slugs;
 }
 
 /** The slug the allowlist names for a model on a driver, or null when no entry can match. */

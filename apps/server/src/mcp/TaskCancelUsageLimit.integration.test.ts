@@ -24,6 +24,7 @@ import { ClaudeProviderCapabilitiesV2 } from "../orchestration-v2/Adapters/Claud
 import * as CommandReceiptStore from "../orchestration-v2/CommandReceiptStore.ts";
 import * as EffectWorker from "../orchestration-v2/EffectWorker.ts";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
+import * as QueuePromotionHold from "../orchestration-v2/QueuePromotionHold.ts";
 import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ProviderAdapterRegistry from "../orchestration-v2/ProviderAdapterRegistry.ts";
@@ -168,6 +169,11 @@ it.effect.each([
               }),
               ProjectionStore.layer.pipe(Layer.provide(SqlitePersistence.layerMemory)),
               ServerSettings.layerTest({ autoResumeLimitedThreads: true }),
+              // fork:model-allowlist
+              Layer.mock(QueuePromotionHold.QueuePromotionHold)({
+                phase: Effect.succeed(null),
+                releases: Stream.never,
+              }),
             ),
           ),
         );

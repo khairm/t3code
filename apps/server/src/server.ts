@@ -734,6 +734,7 @@ const layerMakeRoutes = Layer.mergeAll(
     // fork:model-allowlist
     ServerHttp.layerHoldQueuePromotionRoute,
     ServerHttp.layerReleaseQueuePromotionRoute,
+    ServerHttp.layerQueuePromotionStatusRoute,
     ServerHttp.layerAssetRoute,
     ServerHttp.layerAttachmentUploadRoute,
     GuestHttp.layer,

@@ -29,7 +29,17 @@ const claude = ProviderDriverKind.make("claudeAgent");
 const codex = ProviderDriverKind.make("codex");
 
 describe("T3_ALLOWED_MODELS", () => {
-  it.effect.each(["", " ", "gpt-6-astra,,gpt-6.1-sol", "gpt-6-astra,"])("refuses %j", (value) =>
+  it.effect.each([
+    "",
+    " ",
+    "gpt-6-astra,,gpt-6.1-sol",
+    "gpt-6-astra,",
+    "GPT-6-astra",
+    "claude-opus-5-5[1m]",
+    "opus",
+    "gpt-6-astra high",
+    "o3",
+  ])("refuses %j", (value) =>
     Effect.sync(() => {
       vi.stubEnv(ALLOWED_MODELS_ENV, value);
       assert.throws(() => allowedModels(), ALLOWED_MODELS_ENV);
