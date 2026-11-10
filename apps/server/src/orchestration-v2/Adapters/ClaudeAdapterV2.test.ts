@@ -75,6 +75,7 @@ import * as TestClock from "effect/testing/TestClock";
 import { Tool } from "effect/ai";
 import { formatClaudeResumeCompactionQuestion } from "@t3tools/shared/claudeCompaction";
 import * as HostProcess from "@t3tools/shared/HostProcess";
+import { backgroundWorkHoldsCompletion } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
 import { getModelSelectionStringOptionValue } from "@t3tools/shared/model";
 import { SpawnExecutableResolution } from "@t3tools/shared/shell";
 
@@ -9965,6 +9966,109 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           ),
         ),
       ),
+  );
+
+  it.effect("keeps a finished helper's own background command pending until it ends", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarness;
+        const now = yield* DateTime.now;
+        const latestRoster = () =>
+          providerThreadRosterEvents(harness.events).at(-1)?.providerThread
+            .pendingBackgroundTasks ?? [];
+        yield* harness.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now,
+            attemptId: RunAttemptId.make("attempt-claude-helper-shell"),
+            text: "Start the dev server from a helper.",
+            attachments: [],
+          }),
+        );
+        yield* Queue.offer(
+          harness.sdkMessages,
+          makeSubagentTaskStartedFrame({
+            taskId: "helper",
+            toolUseId: "toolu_helper",
+            uuid: "00000000-0000-4000-8000-000000000211",
+          }),
+        );
+        yield* Queue.offer(
+          harness.sdkMessages,
+          makeResultFrame({
+            uuid: "00000000-0000-4000-8000-000000000212",
+            result: "A helper is starting the dev server.",
+          }),
+        );
+        yield* harness.awaitTerminal(1);
+
+        yield* Queue.offer(
+          harness.sdkMessages,
+          claudeSdkFrame({
+            type: "system",
+            subtype: "task_started",
+            task_id: "helper-shell",
+            tool_use_id: "toolu_helper_shell",
+            description: "npm run dev",
+            is_backgrounded: true,
+            task_type: "local_bash",
+            parent_task_id: "helper",
+            uuid: "00000000-0000-4000-8000-000000000213",
+            session_id: WAKE_NATIVE_SESSION,
+          }),
+        );
+        yield* harness.until(() => latestRoster()[0]?.parentTaskId === "helper");
+        // fork:helper-background-hold: the helper ends its turn while its command runs; the
+        // command still holds the thread.
+        yield* harness.offerAndWait(
+          makeSubagentNotificationFrame({
+            taskId: "helper",
+            toolUseId: "toolu_helper",
+            summary: "The dev server is running.",
+            uuid: "00000000-0000-4000-8000-000000000214",
+          }),
+        );
+        yield* harness.until(() =>
+          harness.events.some(
+            (event) => event.type === "subagent.updated" && event.subagent.status === "completed",
+          ),
+        );
+        assert.deepStrictEqual(
+          latestRoster().map((task) => [task.taskId, task.parentTaskId]),
+          [["helper-shell", "helper"]],
+        );
+        assert.isTrue(backgroundWorkHoldsCompletion(latestRoster()));
+        assert.isTrue(yield* harness.hasPendingBackgroundWork);
+
+        yield* Queue.offer(
+          harness.sdkMessages,
+          claudeSdkFrame({
+            type: "system",
+            subtype: "task_notification",
+            task_id: "helper-shell",
+            tool_use_id: "toolu_helper_shell",
+            status: "completed",
+            output_file: "/tmp/helper-shell.output",
+            summary: "npm run dev exited.",
+            uuid: "00000000-0000-4000-8000-000000000215",
+            session_id: WAKE_NATIVE_SESSION,
+          }),
+        );
+        yield* harness.until(() => latestRoster().length === 0);
+        assert.isFalse(backgroundWorkHoldsCompletion(latestRoster()));
+        assert.isFalse(yield* harness.hasPendingBackgroundWork);
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            IdAllocator.layer,
+            McpProviderSessions.layer,
+            NodeServices.layer,
+            NodeCrypto.layer,
+          ),
+        ),
+      ),
+    ),
   );
 
   it.effect("holds only the background tasks the agent marks awaited, until they end", () =>

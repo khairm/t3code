@@ -11,6 +11,12 @@ describe("backgroundWorkHoldsCompletion", () => {
     ["a dev server's watchdog monitor", false, [{ taskId: "watch", kind: "monitor" }]],
     ["a command the agent waits on", true, [{ taskId: "tests", kind: "command", awaited: true }]],
     ["a subagent", true, [{ taskId: "review", kind: "subagent" }]],
+    [
+      // fork:helper-background-hold
+      "a subagent's own command",
+      true,
+      [{ taskId: "tests", kind: "command", parentTaskId: "review" }],
+    ],
   ] as const)("with %s pending, holds completion: %s", (_case, holds, tasks) => {
     expect(backgroundWorkHoldsCompletion(tasks)).toBe(holds);
   });
