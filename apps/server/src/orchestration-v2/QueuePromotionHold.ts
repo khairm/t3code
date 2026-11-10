@@ -6,13 +6,13 @@ import type { OrchestrationV2Run, ThreadId } from "@t3tools/contracts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
-import * as Data from "effect/Data";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as PubSub from "effect/PubSub";
+import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as SynchronizedRef from "effect/SynchronizedRef";
 
@@ -36,23 +36,26 @@ const QUEUE_PROMOTION_HOLD_LOCK_WAIT = Duration.seconds(20);
 export const QUEUE_PROMOTION_HELD_MESSAGE =
   "T3 is holding new runs for a server restart. Try again once it has restarted.";
 
-export type QueuePromotionHoldPhase = "drain" | "cutover";
+const QueuePromotionHoldPhase = Schema.Literals(["drain", "cutover"]);
+export type QueuePromotionHoldPhase = typeof QueuePromotionHoldPhase.Type;
 
-export type QueuePromotionHoldStatus =
-  | { readonly held: false; readonly generation: number }
-  | {
-      readonly held: true;
-      readonly phase: QueuePromotionHoldPhase;
-      readonly generation: number;
-      readonly heldSince: DateTime.Utc;
-      readonly expiresAt: DateTime.Utc;
-    };
+const QueuePromotionHoldStatus = Schema.Union([
+  Schema.Struct({ held: Schema.Literal(false), generation: Schema.Number }),
+  Schema.Struct({
+    held: Schema.Literal(true),
+    phase: QueuePromotionHoldPhase,
+    generation: Schema.Number,
+    heldSince: Schema.DateTimeUtc,
+    expiresAt: Schema.DateTimeUtc,
+  }),
+]);
+export type QueuePromotionHoldStatus = typeof QueuePromotionHoldStatus.Type;
 
 /** The cutover named a hold that is not the current one: not held, another generation, back in drain, or expired. */
-export class QueuePromotionHoldStaleError extends Data.TaggedError("QueuePromotionHoldStaleError")<{
-  readonly generation: number;
-  readonly status: QueuePromotionHoldStatus;
-}> {
+export class QueuePromotionHoldStaleError extends Schema.TaggedError<QueuePromotionHoldStaleError>()(
+  "QueuePromotionHoldStaleError",
+  { generation: Schema.Number, status: QueuePromotionHoldStatus },
+) {
   override get message(): string {
     const reason = !this.status.held
       ? "it is not held"
@@ -66,9 +69,10 @@ export class QueuePromotionHoldStaleError extends Data.TaggedError("QueuePromoti
 }
 
 /** The hold is in `phase`, but a start decision taken before it has not committed within the limit. */
-export class QueuePromotionHoldLockWaitError extends Data.TaggedError(
+export class QueuePromotionHoldLockWaitError extends Schema.TaggedError<QueuePromotionHoldLockWaitError>()(
   "QueuePromotionHoldLockWaitError",
-)<{ readonly phase: QueuePromotionHoldPhase }> {
+  { phase: QueuePromotionHoldPhase },
+) {
   override get message(): string {
     return `Queue promotion ${this.phase} is set, but a run start decided before it is still committing after ${Duration.format(QUEUE_PROMOTION_HOLD_LOCK_WAIT)}; retry.`;
   }
@@ -252,7 +256,9 @@ const make = Effect.gen(function* () {
     } else if (before.status.phase !== next.phase) {
       yield* publishReleases;
     }
-    yield* awaitEarlierDecisions(() => Effect.fail(new QueuePromotionHoldLockWaitError(next)));
+    yield* awaitEarlierDecisions(() =>
+      Effect.fail(new QueuePromotionHoldLockWaitError({ phase: next.phase })),
+    );
     return next;
   });
 

@@ -4,6 +4,7 @@ import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 
+import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import { ProviderDriverKind } from "@t3tools/contracts";
@@ -48,11 +49,18 @@ describe("T3_ALLOWED_MODELS", () => {
 
   it.effect("the server refuses to start without it", () =>
     Effect.gen(function* () {
-      delete process.env[ALLOWED_MODELS_ENV];
+      vi.stubEnv(ALLOWED_MODELS_ENV, undefined);
       const baseDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-allowlist-"));
       const exit = yield* Effect.exit(
         Command.runWith(cli, { version: "0.0.0" })(["serve", "--base-dir", baseDir]).pipe(
-          Effect.provide(Layer.mergeAll(NodeServices.layer, NetService.layer, TestConsole.layer)),
+          Effect.provide(
+            Layer.mergeAll(
+              NodeServices.layer,
+              NodeCrypto.layer,
+              NetService.layer,
+              TestConsole.layer,
+            ),
+          ),
         ),
       );
       assert.isTrue(Exit.isFailure(exit));

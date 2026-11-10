@@ -242,9 +242,9 @@ function recorderThreadConfigKeys(transcript: CodexAppServerReplayTranscript): R
 const CODEX_HELPERS_OFF_KEYS = ["agents.enabled", "features.multi_agent_v2"] as const;
 
 /**
- * `cwd`, `model` and host-supplied MCP servers (machine-local URLs, short-lived
- * authorization headers) vary per machine, and recorder-only keys are not the
- * client's.
+ * `cwd`, `model`, host-supplied MCP servers (machine-local URLs, short-lived
+ * authorization headers) and the T3 thread id vary per machine or run, and
+ * recorder-only keys are not the client's.
  */
 function normalizeThreadRequest(
   frame: unknown,
@@ -266,7 +266,10 @@ function normalizeThreadRequest(
   if (typeof config !== "object" || config === null) return { ...record, params };
   const owned = Object.fromEntries(
     Object.entries(config as Record<string, unknown>).filter(
-      ([key]) => key !== "mcp_servers" && !key.startsWith("mcp_servers."),
+      ([key]) =>
+        key !== "mcp_servers" &&
+        !key.startsWith("mcp_servers.") &&
+        key !== "shell_environment_policy.set.T3CODE_THREAD_ID",
     ),
   );
   for (const key of ignoredConfigKeys) delete owned[key];
