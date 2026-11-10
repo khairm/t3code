@@ -88,6 +88,7 @@ import * as ResourceCleanupService from "./ResourceCleanupService.ts";
 import * as ThreadLaunchService from "./ThreadLaunchService.ts";
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 import * as QueuePromotionHold from "./QueuePromotionHold.ts";
+import { queuedRunsInDeliveryOrder } from "./QueuedRunOrder.ts";
 import { withProductionAllowlist } from "../provider/allowedModels.testkit.ts";
 import { userFacingDispatchErrorMessage } from "./UserFacingErrors.ts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
@@ -5925,10 +5926,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
   const runUpdated = (
     threadId: ThreadId,
     runId: RunId,
-    matches: (run: {
-      readonly status: string;
-      readonly queueHeld?: boolean | undefined;
-    }) => boolean,
+    matches: (run: OrchestrationV2Run) => boolean,
   ) =>
     Effect.gen(function* () {
       const orchestrator = yield* Orchestrator.OrchestratorV2;
@@ -5945,6 +5943,26 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
           Stream.runHead,
           Effect.forkScoped,
         );
+    });
+
+  /** Completes `run` as its provider would, so the thread considers its next queued run. */
+  const completeRun = (threadId: ThreadId, run: OrchestrationV2Run) =>
+    Effect.gen(function* () {
+      const eventSink = yield* EventSink.EventSinkV2;
+      const now = yield* DateTime.now;
+      yield* eventSink.write({
+        events: [
+          {
+            id: EventId.make(`${run.id}:completed`),
+            type: "run.updated",
+            threadId,
+            runId: run.id,
+            providerInstanceId: run.providerInstanceId,
+            occurredAt: now,
+            payload: { ...run, status: "completed", startedAt: now, completedAt: now },
+          },
+        ],
+      });
     });
 
   const releaseHold = Effect.ensuring(
@@ -6016,70 +6034,6 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
       }).pipe(releaseHold),
   );
 
-  it.effect("starts no queued run while promotion is held, and starts it on release", () =>
-    Effect.gen(function* () {
-      const orchestrator = yield* Orchestrator.OrchestratorV2;
-      const eventSink = yield* EventSink.EventSinkV2;
-      const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
-      const hold = yield* QueuePromotionHold.QueuePromotionHold;
-      const threadId = ThreadId.make("runtime-layer-held-promotion");
-      const { active, queued } = yield* activeAndQueued(threadId);
-      yield* hold.hold;
-      const now = yield* DateTime.now;
-      yield* eventSink.write({
-        events: [
-          {
-            id: EventId.make(`${threadId}:completed`),
-            type: "run.updated",
-            threadId,
-            runId: active.id,
-            providerInstanceId: active.providerInstanceId,
-            occurredAt: now,
-            payload: { ...active, status: "completed", startedAt: now, completedAt: now },
-          },
-        ],
-      });
-      yield* orchestrator.resumeQueuedRuns;
-      yield* worker.drain();
-      const held = yield* orchestrator.getThreadProjection(threadId);
-      assert.equal(held.runs.find((run) => run.id === queued.id)?.status, "queued");
-
-      const started = yield* runUpdated(threadId, queued.id, (run) => run.status === "starting");
-      yield* Effect.yieldNow;
-      yield* hold.release;
-      yield* Fiber.join(started);
-    }).pipe(releaseHold),
-  );
-
-  it.effect("refuses queue.resume and queued-run.start while promotion is held", () =>
-    Effect.gen(function* () {
-      const orchestrator = yield* Orchestrator.OrchestratorV2;
-      const hold = yield* QueuePromotionHold.QueuePromotionHold;
-      const threadId = ThreadId.make("runtime-layer-held-resume");
-      const { queued } = yield* activeAndQueued(threadId);
-      yield* hold.hold;
-      for (const command of [
-        {
-          type: "queue.resume" as const,
-          commandId: CommandId.make(`${threadId}:resume`),
-          threadId,
-        },
-        {
-          type: "queued-run.start" as const,
-          commandId: CommandId.make(`${threadId}:start`),
-          threadId,
-          runId: queued.id,
-        },
-      ]) {
-        const refused = yield* orchestrator.dispatch(command).pipe(Effect.flip);
-        assert.equal(
-          userFacingDispatchErrorMessage(refused),
-          QueuePromotionHold.QUEUE_PROMOTION_HELD_MESSAGE,
-        );
-      }
-    }).pipe(releaseHold),
-  );
-
   /** A message in `threadId`; `overrides` say who sent it and how it starts. */
   const messageCommand = (
     threadId: ThreadId,
@@ -6113,6 +6067,138 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
   const serverWake = { createdBy: "agent", creationSource: "server" } as const;
 
   it.effect(
+    "marks every queued run a drain keeps; recovery leaves them, and a release starts them in order",
+    () =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const recovery = yield* ProviderRuntimeRecoveryService.ProviderRuntimeRecoveryService;
+        const hold = yield* QueuePromotionHold.QueuePromotionHold;
+        const threadId = ThreadId.make("runtime-layer-held-promotion");
+        const active = yield* firstRun(threadId, "active");
+        for (const suffix of ["wake-1", "wake-2"]) {
+          yield* orchestrator.dispatch(
+            messageCommand(threadId, suffix, {
+              ...serverWake,
+              dispatchMode: { type: "queue_after_active" },
+            }),
+          );
+        }
+        const [, wake1, wake2] = (yield* orchestrator.getThreadProjection(threadId)).runs;
+        yield* hold.hold;
+        const marked = yield* runUpdated(threadId, wake2!.id, (run) => run.heldForRestart === true);
+        yield* Effect.yieldNow;
+        yield* completeRun(threadId, active);
+        yield* Fiber.join(marked);
+        const wakes = Effect.map(orchestrator.getThreadProjection(threadId), ({ runs }) =>
+          runs.slice(1),
+        );
+        assert.deepEqual(
+          (yield* wakes).map((run) => run.heldForRestart),
+          [true, true],
+        );
+
+        yield* recovery.reconcile("startup");
+        assert.deepEqual(
+          (yield* wakes).map((run) => run.queueHeld === true),
+          [false, false],
+        );
+
+        const started = yield* runUpdated(threadId, wake1!.id, (run) => run.status === "starting");
+        yield* Effect.yieldNow;
+        yield* hold.release;
+        yield* Fiber.join(started);
+        const second = yield* runUpdated(threadId, wake2!.id, (run) => run.status === "starting");
+        yield* Effect.yieldNow;
+        yield* completeRun(threadId, (yield* wakes)[0]!);
+        yield* Fiber.join(second);
+      }).pipe(releaseHold),
+  );
+
+  it.effect("while draining, starts the owner's message queued behind a run that ends", () =>
+    Effect.gen(function* () {
+      const hold = yield* QueuePromotionHold.QueuePromotionHold;
+      const threadId = ThreadId.make("runtime-layer-drain-owner-behind-active");
+      const { active, queued } = yield* activeAndQueued(threadId);
+      yield* hold.hold;
+      const started = yield* runUpdated(threadId, queued.id, (run) => run.status === "starting");
+      yield* Effect.yieldNow;
+      yield* completeRun(threadId, active);
+      yield* Fiber.join(started);
+    }).pipe(releaseHold),
+  );
+
+  it.effect(
+    "while draining, the owner's send waits behind the runs the hold kept, which start in order",
+    () =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const hold = yield* QueuePromotionHold.QueuePromotionHold;
+        const threadId = ThreadId.make("runtime-layer-drain-owner-behind-kept");
+        yield* createThread(threadId);
+        yield* hold.hold;
+        for (const suffix of ["wake-1", "wake-2"]) {
+          yield* orchestrator.dispatch(messageCommand(threadId, suffix, serverWake));
+        }
+        yield* orchestrator.dispatch(messageCommand(threadId, "owner"));
+        const [wake1, wake2, owner] = (yield* orchestrator.getThreadProjection(threadId)).runs;
+        assert.equal(wake1?.status, "starting");
+        assert.equal(wake2?.status, "queued");
+        assert.equal(owner?.status, "queued");
+        assert.notEqual(owner?.heldForRestart, true);
+
+        const second = yield* runUpdated(threadId, wake2!.id, (run) => run.status === "starting");
+        yield* Effect.yieldNow;
+        yield* completeRun(threadId, wake1!);
+        yield* Fiber.join(second);
+      }).pipe(releaseHold),
+  );
+
+  it.effect(
+    "lets the owner's click start a kept run while draining; the cutover refuses the clicks",
+    () =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const hold = yield* QueuePromotionHold.QueuePromotionHold;
+        const draining = yield* hold.hold;
+        const threadId = ThreadId.make("runtime-layer-drain-click");
+        const kept = yield* firstRun(threadId, "wake", serverWake);
+        assert.isTrue(kept.heldForRestart);
+        yield* orchestrator.dispatch({
+          type: "queued-run.start",
+          commandId: CommandId.make(`${threadId}:start`),
+          threadId,
+          runId: kept.id,
+        });
+        const [clicked] = (yield* orchestrator.getThreadProjection(threadId)).runs;
+        assert.equal(clicked?.status, "starting");
+        assert.notEqual(clicked?.heldForRestart, true);
+
+        const cutoverThreadId = ThreadId.make("runtime-layer-cutover-click");
+        const held = yield* firstRun(cutoverThreadId, "wake", serverWake);
+        yield* hold.cutover(draining.generation);
+        for (const command of [
+          {
+            type: "queue.resume" as const,
+            commandId: CommandId.make(`${cutoverThreadId}:resume`),
+            threadId: cutoverThreadId,
+          },
+          {
+            type: "queued-run.start" as const,
+            commandId: CommandId.make(`${cutoverThreadId}:start`),
+            threadId: cutoverThreadId,
+            runId: held.id,
+          },
+        ]) {
+          const refused = yield* orchestrator.dispatch(command).pipe(Effect.flip);
+          assert.equal(
+            userFacingDispatchErrorMessage(refused),
+            QueuePromotionHold.QUEUE_PROMOTION_HELD_MESSAGE,
+          );
+        }
+      }).pipe(releaseHold),
+  );
+
+  it.effect(
     "queues a server-created message while promotion is held; recovery leaves it to start",
     () =>
       Effect.gen(function* () {
@@ -6141,7 +6227,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
   );
 
   it.effect(
-    "while draining, starts a message its still-active sender caused; holds one from an idle sender",
+    "while draining, starts a message its still-active sender caused and holds one from an idle sender; the cutover holds both",
     () =>
       Effect.gen(function* () {
         const hold = yield* QueuePromotionHold.QueuePromotionHold;
@@ -6149,7 +6235,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         const idleSenderId = ThreadId.make("runtime-layer-held-idle-sender");
         yield* activeAndQueued(busySenderId);
         yield* createThread(idleSenderId);
-        yield* hold.hold;
+        const draining = yield* hold.hold;
         const delegateFrom = (senderThreadId: ThreadId, threadId: ThreadId) =>
           firstRun(threadId, "delegate", {
             createdBy: "agent",
@@ -6167,37 +6253,60 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         );
         assert.equal(fromIdle.status, "queued");
         assert.isTrue(fromIdle.heldForRestart);
+
+        yield* hold.cutover(draining.generation);
+        const fromBusyInCutover = yield* delegateFrom(
+          busySenderId,
+          ThreadId.make("runtime-layer-cutover-child-busy"),
+        );
+        assert.equal(fromBusyInCutover.status, "queued");
+        assert.isTrue(fromBusyInCutover.heldForRestart);
       }).pipe(releaseHold),
   );
 
-  it.effect("holds a prepared launch at its release, and starts it once released", () =>
-    Effect.gen(function* () {
-      const orchestrator = yield* Orchestrator.OrchestratorV2;
-      const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
-      const hold = yield* QueuePromotionHold.QueuePromotionHold;
-      const threadId = ThreadId.make("runtime-layer-held-prepared-launch");
-      yield* hold.hold;
-      const preparing = yield* firstRun(threadId, "launch", {
-        creationSource: "server",
-        dispatchMode: { type: "defer_start", workspaceStrategy: { type: "root" } },
-      });
-      assert.equal(preparing.status, "preparing");
-      yield* orchestrator.dispatch({
-        type: "prepared-run.release",
-        commandId: CommandId.make(`${threadId}:release`),
-        threadId,
-        runId: preparing.id,
-      });
-      yield* worker.drain();
-      const [queued] = (yield* orchestrator.getThreadProjection(threadId)).runs;
-      assert.equal(queued?.status, "queued");
-      assert.isTrue(queued?.heldForRestart);
+  it.effect(
+    "holds a prepared launch at its release ahead of the messages queued behind it, and starts it once released",
+    () =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+        const hold = yield* QueuePromotionHold.QueuePromotionHold;
+        const threadId = ThreadId.make("runtime-layer-held-prepared-launch");
+        yield* hold.hold;
+        const preparing = yield* firstRun(threadId, "launch", {
+          creationSource: "server",
+          dispatchMode: { type: "defer_start", workspaceStrategy: { type: "root" } },
+        });
+        assert.equal(preparing.status, "preparing");
+        yield* orchestrator.dispatch(
+          messageCommand(threadId, "follow-up", { dispatchMode: { type: "queue_after_active" } }),
+        );
+        yield* orchestrator.dispatch({
+          type: "prepared-run.release",
+          commandId: CommandId.make(`${threadId}:release`),
+          threadId,
+          runId: preparing.id,
+        });
+        yield* worker.drain();
+        const released = yield* orchestrator.getThreadProjection(threadId);
+        const [queued, followUp] = released.runs;
+        assert.equal(queued?.status, "queued");
+        assert.isTrue(queued?.heldForRestart);
+        assert.deepEqual(
+          queuedRunsInDeliveryOrder(released).map((run) => run.id),
+          [preparing.id, followUp!.id],
+        );
 
-      const started = yield* runUpdated(threadId, preparing.id, (run) => run.status === "starting");
-      yield* Effect.yieldNow;
-      yield* hold.release;
-      yield* Fiber.join(started);
-    }).pipe(releaseHold),
+        const started = yield* runUpdated(
+          threadId,
+          preparing.id,
+          (run) => run.status === "starting",
+        );
+        yield* Effect.yieldNow;
+        yield* hold.release;
+        yield* Fiber.join(started);
+        assert.equal((yield* orchestrator.getThreadProjection(threadId)).runs[1]?.status, "queued");
+      }).pipe(releaseHold),
   );
 
   it.effect("starts a client send while draining, and queues one during the cutover", () =>
@@ -6212,6 +6321,22 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
       assert.isTrue(held.heldForRestart);
     }).pipe(releaseHold),
   );
+
+  /** Holds, then sends `targetId` a server wake twice; the second refusal proves no rejected receipt was recorded. */
+  const wakeRefusedWhileHeld = (targetId: ThreadId) =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      yield* Effect.flatMap(QueuePromotionHold.QueuePromotionHold, (hold) => hold.hold);
+      const wake = messageCommand(targetId, "wake", serverWake);
+      for (const _attempt of [1, 2]) {
+        const refused = yield* orchestrator.dispatch(wake).pipe(Effect.flip);
+        assert.equal(
+          userFacingDispatchErrorMessage(refused),
+          QueuePromotionHold.QUEUE_PROMOTION_HELD_MESSAGE,
+        );
+      }
+      return wake;
+    });
 
   it.effect("refuses a server message a pending fork cannot queue, leaving no receipt behind", () =>
     Effect.gen(function* () {
@@ -6230,16 +6355,127 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         createdBy: "user",
         creationSource: "web",
       });
+      const wake = yield* wakeRefusedWhileHeld(forkId);
+      yield* hold.release;
+      yield* orchestrator.dispatch(wake);
+      assert.equal((yield* orchestrator.getThreadProjection(forkId)).runs[0]?.status, "starting");
+    }).pipe(releaseHold),
+  );
+
+  it.effect(
+    "refuses a server message a pending merge-back cannot queue, with the hold's message",
+    () =>
+      Effect.gen(function* () {
+        const eventSink = yield* EventSink.EventSinkV2;
+        const sourceId = ThreadId.make("runtime-layer-held-merge-back-source");
+        const targetId = ThreadId.make("runtime-layer-held-merge-back-target");
+        yield* createThread(targetId);
+        const now = yield* DateTime.now;
+        yield* eventSink.write({
+          events: [
+            {
+              id: EventId.make(`${targetId}:merge-back`),
+              type: "context-transfer.created",
+              threadId: targetId,
+              occurredAt: now,
+              payload: {
+                id: ContextTransferId.make(`${targetId}:merge-back`),
+                type: "merge_back",
+                sourceThreadId: sourceId,
+                targetThreadId: targetId,
+                sourcePoint: { threadId: sourceId, runId: RunId.make(`${sourceId}:run`) },
+                basePoint: null,
+                sourceProviderInstanceId: modelSelection.instanceId,
+                targetProviderInstanceId: modelSelection.instanceId,
+                targetRunId: null,
+                status: "pending",
+                resolution: null,
+                createdBy: "user",
+                error: null,
+                createdAt: now,
+                updatedAt: now,
+                consumedAt: null,
+              },
+            },
+          ],
+        });
+        yield* wakeRefusedWhileHeld(targetId);
+      }).pipe(releaseHold),
+  );
+
+  it.effect("refuses a usage-limit resume while draining, which resumes after the release", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const eventSink = yield* EventSink.EventSinkV2;
+      const hold = yield* QueuePromotionHold.QueuePromotionHold;
+      const threadId = ThreadId.make("runtime-layer-held-limit-resume");
+      const limited = yield* firstRun(threadId, "limited");
+      const now = yield* DateTime.now;
+      const resetAt = DateTime.formatIso(DateTime.add(now, { minutes: 1 }));
+      yield* eventSink.write({
+        events: [
+          {
+            id: EventId.make(`${threadId}:limit`),
+            type: "turn-item.updated",
+            threadId,
+            runId: limited.id,
+            providerInstanceId: limited.providerInstanceId,
+            occurredAt: now,
+            payload: {
+              id: TurnItemId.make(`${threadId}:limit`),
+              type: "error",
+              threadId,
+              runId: limited.id,
+              nodeId: limited.rootNodeId,
+              providerThreadId: limited.providerThreadId,
+              providerTurnId: null,
+              nativeItemRef: null,
+              parentItemId: null,
+              ordinal: 1,
+              status: "failed",
+              title: "Usage limit reached",
+              startedAt: now,
+              completedAt: now,
+              updatedAt: now,
+              failure: {
+                class: "usage_limit",
+                message: "Plan limit reached.",
+                code: "usageLimitExceeded",
+                retryable: null,
+                resetAt,
+              },
+            },
+          },
+          {
+            id: EventId.make(`${threadId}:failed`),
+            type: "run.updated",
+            threadId,
+            runId: limited.id,
+            providerInstanceId: limited.providerInstanceId,
+            occurredAt: now,
+            payload: { ...limited, status: "failed", startedAt: now, completedAt: now },
+          },
+        ],
+      });
+      const shell = Effect.map(orchestrator.getShellSnapshot(), (snapshot) =>
+        snapshot.threads.find((thread) => thread.id === threadId)!,
+      );
+      yield* orchestrator.dispatch(
+        limitRecoveryCommand(yield* shell, true, DateTime.toEpochMillis(now))!,
+      );
+      const resume = limitRecoveryCommand(yield* shell, true, Date.parse(resetAt))!;
+      assert.equal(resume.type, "message.dispatch");
+      yield* TestClock.adjust("1 minute");
+
       yield* hold.hold;
-      const wake = messageCommand(forkId, "wake", serverWake);
-      const refused = yield* orchestrator.dispatch(wake).pipe(Effect.flip);
+      const refused = yield* orchestrator.dispatch(resume).pipe(Effect.flip);
       assert.equal(
         userFacingDispatchErrorMessage(refused),
         QueuePromotionHold.QUEUE_PROMOTION_HELD_MESSAGE,
       );
       yield* hold.release;
-      yield* orchestrator.dispatch(wake);
-      assert.equal((yield* orchestrator.getThreadProjection(forkId)).runs[0]?.status, "starting");
+      yield* orchestrator.dispatch(resume);
+      assert.equal((yield* orchestrator.getThreadProjection(threadId)).runs[1]?.status, "starting");
     }).pipe(releaseHold),
   );
 

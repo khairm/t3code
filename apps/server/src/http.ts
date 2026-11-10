@@ -450,7 +450,10 @@ const queuePromotionRoute = (
     ),
   );
 
-/** `{}` or `{"phase":"drain"}` sets or refreshes the drain; `{"phase":"cutover","generation":n}` moves that hold to cutover. */
+/**
+ * `{}` sets a drain hold or refreshes the current one in its phase; `{"phase":"drain"}` also brings
+ * a cutover back to drain; `{"phase":"cutover","generation":n}` moves that hold to cutover.
+ */
 export const layerHoldQueuePromotionRoute = queuePromotionRoute(
   "POST",
   HOLD_QUEUE_PROMOTION_PATH,
@@ -459,7 +462,11 @@ export const layerHoldQueuePromotionRoute = queuePromotionRoute(
     const text = yield* request.text.pipe(Effect.orDie);
     const body = yield* decodeQueuePromotionHoldRequest(text.trim() === "" ? "{}" : text);
     return queuePromotionStatusJson(
-      yield* body.phase === "cutover" ? hold.cutover(body.generation) : hold.hold,
+      yield* body.phase === "cutover"
+        ? hold.cutover(body.generation)
+        : body.phase === "drain"
+          ? hold.drain
+          : hold.hold,
     );
   }),
 );

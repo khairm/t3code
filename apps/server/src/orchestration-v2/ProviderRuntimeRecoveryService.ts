@@ -345,8 +345,9 @@ export const make = Effect.gen(function* () {
           runs.push(run);
           continue;
         }
-        // fork:model-allowlist: a run the restart hold queued starts again on its own after startup.
-        if (run.queueHeld === true || run.heldForRestart === true) continue;
+        // fork:model-allowlist: a queue the restart hold kept starts on its own after startup.
+        if (run.queueHeld === true || queuedRuns.some((kept) => kept.heldForRestart === true))
+          continue;
         events.push({
           id: yield* allocateEventId(),
           type: "run.updated",

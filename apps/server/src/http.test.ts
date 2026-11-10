@@ -949,13 +949,15 @@ describe("queue promotion hold routes", () => {
   );
 
   it.effect(
-    "holds, refreshes keeping heldSince, reports, and releases to the next generation",
+    "holds with a generation seeded from the clock, refreshes keeping heldSince, reports, and releases to the next generation",
     () =>
       Effect.gen(function* () {
+        const seed = Date.parse("2026-11-09T22:00:00.000Z");
+        yield* TestClock.setTime(seed);
         const { request } = yield* serveHoldRoutes();
         const held = yield* request("POST", HOLD, "maintain");
         expect(held.status).toBe(200);
-        expect(held.body).toMatchObject({ held: true, phase: "drain", generation: 0 });
+        expect(held.body).toMatchObject({ held: true, phase: "drain", generation: seed });
         const { heldSince, expiresAt } = held.body;
         expect(typeof heldSince).toBe("string");
 
@@ -964,7 +966,7 @@ describe("queue promotion hold routes", () => {
         expect(refreshed.body).toMatchObject({
           held: true,
           phase: "drain",
-          generation: 0,
+          generation: seed,
           heldSince,
         });
         expect(
@@ -974,41 +976,92 @@ describe("queue promotion hold routes", () => {
 
         expect((yield* request("POST", RELEASE, "maintain")).body).toEqual({
           held: false,
+          generation: seed + 1,
+        });
+        expect((yield* request("GET", HOLD, "maintain")).body).toEqual({
+          held: false,
+          generation: seed + 1,
+        });
+      }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect(
+    "moves the hold to cutover only for its own generation; {} keeps the phase, drain brings it back",
+    () =>
+      Effect.gen(function* () {
+        const { request } = yield* serveHoldRoutes();
+        const cutover = (generation: number) =>
+          request("POST", HOLD, "maintain", { phase: "cutover", generation });
+        const unheld = yield* cutover(0);
+        expect(unheld.status).toBe(409);
+        expect(unheld.body.error).toBe("stale_generation");
+
+        yield* request("POST", HOLD, "maintain");
+        yield* request("POST", RELEASE, "maintain");
+        yield* request("POST", HOLD, "maintain");
+        expect((yield* cutover(0)).status).toBe(409);
+        expect((yield* request("GET", HOLD, "maintain")).body).toMatchObject({
+          phase: "drain",
           generation: 1,
         });
+        const current = yield* cutover(1);
+        expect(current.status).toBe(200);
+        expect(current.body).toMatchObject({ held: true, phase: "cutover", generation: 1 });
+
+        const unnamed = yield* request("POST", HOLD, "maintain", { phase: "cutover" });
+        expect(unnamed.status).toBe(400);
+        expect((yield* request("POST", HOLD, "maintain", "not json")).status).toBe(400);
+        expect((yield* request("GET", HOLD, "maintain")).body).toMatchObject({ phase: "cutover" });
+
+        expect((yield* request("POST", HOLD, "maintain", {})).body).toMatchObject({
+          phase: "cutover",
+          generation: 1,
+        });
+        expect((yield* request("POST", HOLD, "maintain", { phase: "drain" })).body).toMatchObject({
+          phase: "drain",
+          generation: 1,
+        });
+        expect((yield* cutover(1)).body).toMatchObject({ phase: "cutover", generation: 1 });
+      }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("expires a cutover 2 minutes after it was set", () =>
+    Effect.gen(function* () {
+      const { request } = yield* serveHoldRoutes();
+      yield* request("POST", HOLD, "maintain");
+      yield* request("POST", HOLD, "maintain", { phase: "cutover", generation: 0 });
+      yield* TestClock.adjust("2 minutes");
+      expect((yield* request("GET", HOLD, "maintain")).body).toEqual({
+        held: false,
+        generation: 1,
+      });
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect(
+    "a cutover brought back to drain emits a release and keeps the drain's own 30-minute expiry",
+    () =>
+      Effect.gen(function* () {
+        const { request, hold } = yield* serveHoldRoutes();
+        yield* request("POST", HOLD, "maintain");
+        yield* request("POST", HOLD, "maintain", { phase: "cutover", generation: 0 });
+        const lowered = yield* hold.releases.pipe(Stream.runHead, Effect.forkScoped);
+        yield* Effect.yieldNow;
+        yield* request("POST", HOLD, "maintain", { phase: "drain" });
+        yield* Fiber.join(lowered);
+        // The cutover's own expiry must not clear the drain that replaced it.
+        yield* TestClock.adjust("2 minutes");
+        expect((yield* request("GET", HOLD, "maintain")).body).toMatchObject({
+          held: true,
+          phase: "drain",
+          generation: 0,
+        });
+        yield* TestClock.adjust("28 minutes");
         expect((yield* request("GET", HOLD, "maintain")).body).toEqual({
           held: false,
           generation: 1,
         });
       }).pipe(Effect.provide(NodeServices.layer)),
-  );
-
-  it.effect("moves the hold to cutover only for its own generation", () =>
-    Effect.gen(function* () {
-      const { request } = yield* serveHoldRoutes();
-      const cutover = (generation: number) =>
-        request("POST", HOLD, "maintain", { phase: "cutover", generation });
-      const unheld = yield* cutover(0);
-      expect(unheld.status).toBe(409);
-      expect(unheld.body.error).toBe("stale_generation");
-
-      yield* request("POST", HOLD, "maintain");
-      yield* request("POST", RELEASE, "maintain");
-      yield* request("POST", HOLD, "maintain");
-      expect((yield* cutover(0)).status).toBe(409);
-      expect((yield* request("GET", HOLD, "maintain")).body).toMatchObject({
-        phase: "drain",
-        generation: 1,
-      });
-      const current = yield* cutover(1);
-      expect(current.status).toBe(200);
-      expect(current.body).toMatchObject({ held: true, phase: "cutover", generation: 1 });
-
-      const unnamed = yield* request("POST", HOLD, "maintain", { phase: "cutover" });
-      expect(unnamed.status).toBe(400);
-      expect((yield* request("POST", HOLD, "maintain", "not json")).status).toBe(400);
-      expect((yield* request("GET", HOLD, "maintain")).body).toMatchObject({ phase: "cutover" });
-    }).pipe(Effect.provide(NodeServices.layer)),
   );
 
   it.effect("expires 30 minutes after the last refresh, so a late cutover is refused", () =>
@@ -1029,8 +1082,8 @@ describe("queue promotion hold routes", () => {
     }).pipe(Effect.provide(NodeServices.layer)),
   );
 
-  /** Signals once the hold waits on a thread lock: the second lock taken after the in-flight decision's. */
-  const layerSpyLocks = (holdWaiting: Deferred.Deferred<void>) => {
+  /** Thread locks that signal `barrierWaiting` once a second user queues behind the in-flight decision's lock. */
+  const layerSpyLocks = (barrierWaiting: Deferred.Deferred<void>) => {
     let lockUsers = 0;
     return Layer.effect(
       ThreadCommandExecutor.ThreadCommandExecutor,
@@ -1038,7 +1091,7 @@ describe("queue promotion hold routes", () => {
         ...locks,
         withLock: <A, E, R>(threadId: ThreadId, effect: Effect.Effect<A, E, R>) =>
           Effect.suspend(() =>
-            (++lockUsers === 2 ? Deferred.succeed(holdWaiting, undefined) : Effect.void).pipe(
+            (++lockUsers === 2 ? Deferred.succeed(barrierWaiting, undefined) : Effect.void).pipe(
               Effect.andThen(locks.withLock(threadId, effect)),
             ),
           ),
@@ -1046,45 +1099,97 @@ describe("queue promotion hold routes", () => {
     );
   };
 
-  /** A hold request forked while a start decision holds its thread lock; `commit` lets the decision finish. */
-  const holdBehindStuckDecision = Effect.gen(function* () {
-    const holdWaiting = yield* Deferred.make<void>();
-    const { request, hold, threadLocks } = yield* serveHoldRoutes(layerSpyLocks(holdWaiting));
+  /**
+   * Routes (already holding, when `held`) with a start decision that keeps its thread lock until
+   * `commit`; `barrierWaiting` signals once a hold transition waits behind that decision.
+   */
+  const serveBehindStuckDecision = Effect.fn("serveBehindStuckDecision")(function* (held: boolean) {
+    const barrierWaiting = yield* Deferred.make<void>();
+    const served = yield* serveHoldRoutes(layerSpyLocks(barrierWaiting));
+    if (held) yield* served.request("POST", HOLD, "maintain");
     const decisionStarted = yield* Deferred.make<void>();
     const commit = yield* Deferred.make<void>();
-    const decision = yield* threadLocks
+    const decision = yield* served.threadLocks
       .withLock(
         ThreadId.make("thread-in-flight"),
         Deferred.succeed(decisionStarted, undefined).pipe(Effect.andThen(Deferred.await(commit))),
       )
       .pipe(Effect.forkScoped);
     yield* Deferred.await(decisionStarted);
+    return { ...served, barrierWaiting, decision, commit };
+  });
+
+  /** A hold request (a refresh, when already `held`) forked behind a stuck decision. */
+  const holdBehindStuckDecision = Effect.fn("holdBehindStuckDecision")(function* (held: boolean) {
+    const { request, hold, barrierWaiting, decision, commit } =
+      yield* serveBehindStuckDecision(held);
     const reply = yield* request("POST", HOLD, "maintain").pipe(Effect.forkScoped);
-    yield* Deferred.await(holdWaiting);
+    yield* Deferred.await(barrierWaiting);
     expect((yield* hold.status).held).toBe(true);
     return { reply, decision, commit };
   });
 
-  it.effect("replies to a hold only once a start decision already under way has committed", () =>
-    Effect.gen(function* () {
-      const { reply, decision, commit } = yield* holdBehindStuckDecision;
-      expect(reply.pollUnsafe()).toBeUndefined();
-      yield* Deferred.succeed(commit, undefined);
-      yield* Fiber.join(decision);
-      expect((yield* Fiber.join(reply)).status).toBe(200);
-    }).pipe(Effect.provide(NodeServices.layer)),
+  it.effect.each([false, true])(
+    "replies to a hold only once a start decision already under way has committed (refresh: %s)",
+    (held) =>
+      Effect.gen(function* () {
+        const { reply, decision, commit } = yield* holdBehindStuckDecision(held);
+        expect(reply.pollUnsafe()).toBeUndefined();
+        yield* Deferred.succeed(commit, undefined);
+        yield* Fiber.join(decision);
+        expect((yield* Fiber.join(reply)).status).toBe(200);
+      }).pipe(Effect.provide(NodeServices.layer)),
   );
 
-  it.effect(
-    "answers with a clear error when an earlier decision has not committed in 20 seconds",
-    () =>
+  it.effect.each([false, true])(
+    "answers with a clear error when an earlier decision has not committed in 20 seconds (refresh: %s)",
+    (held) =>
       Effect.gen(function* () {
-        const { reply, commit } = yield* holdBehindStuckDecision;
+        const { reply, commit } = yield* holdBehindStuckDecision(held);
         yield* TestClock.adjust("20 seconds");
         const timedOut = yield* Fiber.join(reply);
         expect(timedOut.status).toBe(503);
         expect(timedOut.body.error).toBe("lock_wait_timeout");
         yield* Deferred.succeed(commit, undefined);
+      }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("emits a release only once a decision in flight at the release has committed", () =>
+    Effect.gen(function* () {
+      const { request, hold, barrierWaiting, decision, commit } =
+        yield* serveBehindStuckDecision(true);
+      const released = yield* hold.releases.pipe(Stream.runHead, Effect.forkScoped);
+      yield* Effect.yieldNow;
+      expect((yield* request("POST", RELEASE, "maintain")).body).toEqual({
+        held: false,
+        generation: 1,
+      });
+      yield* Deferred.await(barrierWaiting);
+      expect(released.pollUnsafe()).toBeUndefined();
+      yield* Deferred.succeed(commit, undefined);
+      yield* Fiber.join(decision);
+      yield* Fiber.join(released);
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect(
+    "refuses a cutover whose hold was released while it waited for an earlier decision",
+    () =>
+      Effect.gen(function* () {
+        const { request, hold, barrierWaiting, decision, commit } =
+          yield* serveBehindStuckDecision(true);
+        const reply = yield* request("POST", HOLD, "maintain", {
+          phase: "cutover",
+          generation: 0,
+        }).pipe(Effect.forkScoped);
+        yield* Deferred.await(barrierWaiting);
+        expect(yield* hold.status).toMatchObject({ phase: "cutover" });
+        yield* request("POST", RELEASE, "maintain");
+        yield* Deferred.succeed(commit, undefined);
+        yield* Fiber.join(decision);
+        const refused = yield* Fiber.join(reply);
+        expect(refused.status).toBe(409);
+        expect(refused.body.error).toBe("stale_generation");
       }).pipe(Effect.provide(NodeServices.layer)),
   );
 });
