@@ -6574,6 +6574,46 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
   );
 
   it.effect(
+    "while draining, the owner's retried click starts the kept run when its first dispatch committed but never started it",
+    () =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const eventSink = yield* EventSink.EventSinkV2;
+        const hold = yield* QueuePromotionHold.QueuePromotionHold;
+        yield* hold.hold;
+        const threadId = ThreadId.make("runtime-layer-drain-click-replay");
+        const kept = yield* firstRun(threadId, "wake", serverWake);
+        assert.isTrue(kept.heldForRestart);
+        const click = {
+          type: "queued-run.start" as const,
+          commandId: CommandId.make(`${threadId}:start`),
+          threadId,
+          runId: kept.id,
+        };
+        // The click's receipt commits, then its request ends before the start runs.
+        const commitCommand = eventSink.commitCommand;
+        const commitSpy = vi
+          .spyOn(eventSink, "commitCommand")
+          .mockImplementation((input) =>
+            input.commandId === click.commandId
+              ? commitCommand(input).pipe(Effect.andThen(Effect.die("connection dropped")))
+              : commitCommand(input),
+          );
+        const dropped = yield* orchestrator
+          .dispatch(click)
+          .pipe(Effect.exit, Effect.ensuring(Effect.sync(() => commitSpy.mockRestore())));
+        assert.equal(dropped._tag, "Failure");
+        assert.equal((yield* orchestrator.getThreadProjection(threadId)).runs[0]?.status, "queued");
+
+        const retried = yield* orchestrator.dispatch(click);
+        assert.isTrue(retried.replayed);
+        const [started] = (yield* orchestrator.getThreadProjection(threadId)).runs;
+        assert.equal(started?.status, "starting");
+        assert.notEqual(started?.heldForRestart, true);
+      }).pipe(releaseHold),
+  );
+
+  it.effect(
     "queues a server-created message while promotion is held; recovery leaves it to start",
     () =>
       Effect.gen(function* () {
