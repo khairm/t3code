@@ -6115,6 +6115,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
       return (yield* orchestrator.getThreadProjection(threadId)).runs[0]!;
     });
   const serverWake = { createdBy: "agent", creationSource: "server" } as const;
+  const mcpSend = { createdBy: "agent", creationSource: "mcp" } as const;
 
   it.effect(
     "marks every queued run a drain keeps; recovery leaves them, and a release starts them in order",
@@ -6288,11 +6289,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         yield* createThread(idleSenderId);
         const draining = yield* hold.hold;
         const delegateFrom = (senderThreadId: ThreadId, threadId: ThreadId) =>
-          firstRun(threadId, "delegate", {
-            createdBy: "agent",
-            creationSource: "mcp",
-            senderThreadId,
-          });
+          firstRun(threadId, "delegate", { ...mcpSend, senderThreadId });
         const fromBusy = yield* delegateFrom(
           busySenderId,
           ThreadId.make("runtime-layer-held-child-busy"),
@@ -6375,24 +6372,27 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
       }).pipe(releaseHold),
   );
 
-  it.effect("marks a run queued behind an active run while held, so recovery leaves it", () =>
-    Effect.gen(function* () {
-      const orchestrator = yield* Orchestrator.OrchestratorV2;
-      const recovery = yield* ProviderRuntimeRecoveryService.ProviderRuntimeRecoveryService;
-      const hold = yield* QueuePromotionHold.QueuePromotionHold;
-      const threadId = ThreadId.make("runtime-layer-marked-at-queue");
-      yield* firstRun(threadId, "active");
-      yield* hold.hold;
-      yield* orchestrator.dispatch(
-        messageCommand(threadId, "behind", { dispatchMode: { type: "queue_after_active" } }),
-      );
-      const [, queued] = (yield* orchestrator.getThreadProjection(threadId)).runs;
-      assert.isTrue(queued?.heldForRestart);
-      yield* recovery.reconcile("startup");
-      const [, recovered] = (yield* orchestrator.getThreadProjection(threadId)).runs;
-      assert.equal(recovered?.status, "queued");
-      assert.notEqual(recovered?.queueHeld, true);
-    }).pipe(releaseHold),
+  it.effect(
+    "marks a run queued behind an active run while held; a startup that cuts that run holds the queue for the owner",
+    () =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const recovery = yield* ProviderRuntimeRecoveryService.ProviderRuntimeRecoveryService;
+        const hold = yield* QueuePromotionHold.QueuePromotionHold;
+        const threadId = ThreadId.make("runtime-layer-marked-at-queue");
+        yield* firstRun(threadId, "active");
+        yield* hold.hold;
+        yield* orchestrator.dispatch(
+          messageCommand(threadId, "behind", { dispatchMode: { type: "queue_after_active" } }),
+        );
+        const [, queued] = (yield* orchestrator.getThreadProjection(threadId)).runs;
+        assert.isTrue(queued?.heldForRestart);
+        yield* recovery.reconcile("startup");
+        const [cut, recovered] = (yield* orchestrator.getThreadProjection(threadId)).runs;
+        assert.equal(cut?.status, "cancelled");
+        assert.equal(recovered?.status, "queued");
+        assert.isTrue(recovered?.queueHeld);
+      }).pipe(releaseHold),
   );
 
   it.effect("the cutover marks a queue behind a run still active, ahead of that run's end", () =>
@@ -6465,24 +6465,25 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         assert.equal(compaction.status, "queued");
         assert.isTrue(compaction.heldForRestart);
         yield* orchestrator.dispatch(
-          messageCommand(delegateId, "delegate", {
-            createdBy: "agent",
-            creationSource: "mcp",
-            senderThreadId: busySenderId,
-          }),
+          messageCommand(delegateId, "delegate", { ...mcpSend, senderThreadId: busySenderId }),
         );
         assert.equal(
           (yield* orchestrator.getThreadProjection(delegateId)).runs[1]?.status,
           "starting",
         );
 
-        const ownerId = ThreadId.make("runtime-layer-compaction-then-owner");
-        const queuedCompaction = yield* firstRun(ownerId, "compact", idleCompaction);
-        yield* orchestrator.dispatch(messageCommand(ownerId, "owner"));
-        const [cancelled, owner] = (yield* orchestrator.getThreadProjection(ownerId)).runs;
-        assert.equal(cancelled?.id, queuedCompaction.id);
-        assert.equal(cancelled?.status, "cancelled");
-        assert.equal(owner?.status, "starting");
+        for (const [suffix, overrides] of [
+          ["owner", {}],
+          ["voice", mcpSend],
+        ] as const) {
+          const ownerId = ThreadId.make(`runtime-layer-compaction-then-${suffix}`);
+          const queuedCompaction = yield* firstRun(ownerId, "compact", idleCompaction);
+          yield* orchestrator.dispatch(messageCommand(ownerId, suffix, overrides));
+          const [cancelled, owner] = (yield* orchestrator.getThreadProjection(ownerId)).runs;
+          assert.equal(cancelled?.id, queuedCompaction.id);
+          assert.equal(cancelled?.status, "cancelled");
+          assert.equal(owner?.status, "starting");
+        }
       }).pipe(releaseHold),
   );
 
@@ -6534,40 +6535,38 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
     }).pipe(releaseHold),
   );
 
+  /** A completed first run whose provider thread still lists `tasks`. */
+  const ended = (threadId: ThreadId, tasks: ReadonlyArray<OrchestrationV2PendingBackgroundTask>) =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const eventSink = yield* EventSink.EventSinkV2;
+      const run = yield* firstRun(threadId, "send");
+      yield* completeRun(threadId, run);
+      const providerThread = (yield* orchestrator.getThreadProjection(threadId))
+        .providerThreads[0]!;
+      const now = yield* DateTime.now;
+      yield* eventSink.write({
+        events: [
+          {
+            id: EventId.make(`${threadId}:roster`),
+            type: "provider-thread.updated",
+            threadId,
+            driver: providerThread.driver,
+            providerInstanceId: providerThread.providerInstanceId,
+            occurredAt: now,
+            payload: { ...providerThread, pendingBackgroundTasks: tasks, updatedAt: now },
+          },
+        ],
+      });
+      return run;
+    });
+
   it.effect(
     "counts background work the chat still shows as Working after its run ended, not a process T3 no longer waits on",
     () =>
       Effect.gen(function* () {
-        const orchestrator = yield* Orchestrator.OrchestratorV2;
-        const eventSink = yield* EventSink.EventSinkV2;
         const hold = yield* QueuePromotionHold.QueuePromotionHold;
         const before = yield* hold.busy;
-        /** A completed first run whose provider thread still lists `tasks`. */
-        const ended = (
-          threadId: ThreadId,
-          tasks: ReadonlyArray<OrchestrationV2PendingBackgroundTask>,
-        ) =>
-          Effect.gen(function* () {
-            const run = yield* firstRun(threadId, "send");
-            yield* completeRun(threadId, run);
-            const providerThread = (yield* orchestrator.getThreadProjection(threadId))
-              .providerThreads[0]!;
-            const now = yield* DateTime.now;
-            yield* eventSink.write({
-              events: [
-                {
-                  id: EventId.make(`${threadId}:roster`),
-                  type: "provider-thread.updated",
-                  threadId,
-                  driver: providerThread.driver,
-                  providerInstanceId: providerThread.providerInstanceId,
-                  occurredAt: now,
-                  payload: { ...providerThread, pendingBackgroundTasks: tasks, updatedAt: now },
-                },
-              ],
-            });
-            return run;
-          });
         yield* ended(ThreadId.make("runtime-layer-busy-awaited-task"), [
           { taskId: "tests", kind: "background_task" },
         ]);
@@ -6588,6 +6587,29 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         }));
         assert.equal((yield* hold.busy) - before, 2);
       }),
+  );
+
+  it.effect(
+    "counts awaited background work of an ended run while a run the hold kept waits behind it",
+    () =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const hold = yield* QueuePromotionHold.QueuePromotionHold;
+        const threadId = ThreadId.make("runtime-layer-busy-awaited-behind-kept");
+        const before = yield* hold.busy;
+        yield* ended(threadId, [{ taskId: "tests", kind: "background_task" }]);
+        assert.equal((yield* hold.busy) - before, 1);
+        yield* hold.hold;
+        yield* orchestrator.dispatch(messageCommand(threadId, "wake", serverWake));
+        const [, kept] = (yield* orchestrator.getThreadProjection(threadId)).runs;
+        assert.isTrue(kept?.heldForRestart);
+        assert.equal((yield* hold.busy) - before, 1);
+
+        const started = yield* runUpdated(threadId, kept!.id, (run) => run.status === "starting");
+        yield* Effect.yieldNow;
+        yield* hold.release;
+        yield* Fiber.join(started);
+      }).pipe(releaseHold),
   );
 
   /** A pending question on `threadId` asked by `runId`, answered live into `providerSessionId` or as a message. */
@@ -6734,7 +6756,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
   );
 
   it.effect(
-    "the cutover refuses a live answer, which the drain accepts and counts busy until its delivery is tried",
+    "the cutover refuses a live answer, which the drain accepts and counts busy, retries too, until it fails for good",
     () =>
       Effect.gen(function* () {
         const orchestrator = yield* Orchestrator.OrchestratorV2;
@@ -6765,9 +6787,15 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         yield* hold.drain;
         yield* orchestrator.dispatch(answer);
         assert.equal((yield* hold.busy) - before, 1);
-        assert.include(yield* outbox.threadIdsDelivering("runtime-request.respond"), threadId);
+        // The drain also settles other tests' effects, so busy is not compared after it.
+        const delivering = outbox.threadIdsDelivering("runtime-request.respond");
         yield* worker.drain();
-        assert.notInclude(yield* outbox.threadIdsDelivering("runtime-request.respond"), threadId);
+        assert.include(yield* delivering, threadId);
+        for (const _retry of [2, 3, 4, 5]) {
+          yield* TestClock.adjust("1 second");
+          yield* worker.drain();
+        }
+        assert.notInclude(yield* delivering, threadId);
       }).pipe(releaseHold),
   );
 
@@ -6777,7 +6805,6 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
       Effect.gen(function* () {
         const hold = yield* QueuePromotionHold.QueuePromotionHold;
         yield* hold.hold;
-        const mcpSend = { createdBy: "agent" as const, creationSource: "mcp" as const };
         const voice = yield* firstRun(
           ThreadId.make("runtime-layer-drain-mcp-no-sender"),
           "voice",

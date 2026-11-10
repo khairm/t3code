@@ -1125,15 +1125,19 @@ describe("queue promotion hold routes", () => {
     return { ...served, barrierWaiting, decision, commit };
   });
 
-  /** A hold request (a refresh, when already `held`) forked behind a stuck decision. */
-  const holdBehindStuckDecision = Effect.fn("holdBehindStuckDecision")(function* (held: boolean) {
+  /** A hold request with `body` (none: a refresh, when already `held`) forked behind a stuck decision. */
+  const holdBehindStuckDecision = Effect.fn("holdBehindStuckDecision")(function* (
+    held: boolean,
+    body?: Record<string, unknown>,
+  ) {
     const { request, hold, barrierWaiting, decision, commit } =
       yield* serveBehindStuckDecision(held);
-    const reply = yield* request("POST", HOLD, "maintain").pipe(Effect.forkScoped);
+    const reply = yield* request("POST", HOLD, "maintain", body).pipe(Effect.forkScoped);
     yield* Deferred.await(barrierWaiting);
     expect((yield* hold.status).held).toBe(true);
-    return { reply, decision, commit };
+    return { request, hold, reply, decision, commit };
   });
+  const CUTOVER = { phase: "cutover", generation: 0 };
 
   it.effect.each([false, true])(
     "replies to a hold only once a start decision already under way has committed (refresh: %s)",
@@ -1157,6 +1161,30 @@ describe("queue promotion hold routes", () => {
         expect(timedOut.status).toBe(503);
         expect(timedOut.body.error).toBe("lock_wait_timeout");
         yield* Deferred.succeed(commit, undefined);
+      }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect(
+    "a cutover whose wait times out goes back to drain, starting what drain allows, and can be asked again",
+    () =>
+      Effect.gen(function* () {
+        const { request, hold, reply, decision, commit } = yield* holdBehindStuckDecision(
+          true,
+          CUTOVER,
+        );
+        expect(yield* hold.status).toMatchObject({ phase: "cutover" });
+        const lowered = yield* hold.releases.pipe(Stream.runHead, Effect.forkScoped);
+        yield* Effect.yieldNow;
+        yield* TestClock.adjust("20 seconds");
+        const timedOut = yield* Fiber.join(reply);
+        expect(timedOut.status).toBe(503);
+        expect(timedOut.body.error).toBe("lock_wait_timeout");
+        expect(yield* hold.status).toMatchObject({ held: true, phase: "drain", generation: 0 });
+
+        yield* Deferred.succeed(commit, undefined);
+        yield* Fiber.join(decision);
+        yield* Fiber.join(lowered);
+        expect((yield* request("POST", HOLD, "maintain", CUTOVER)).body).toMatchObject(CUTOVER);
       }).pipe(Effect.provide(NodeServices.layer)),
   );
 
@@ -1199,13 +1227,10 @@ describe("queue promotion hold routes", () => {
     "refuses a cutover whose hold was released while it waited for an earlier decision",
     () =>
       Effect.gen(function* () {
-        const { request, hold, barrierWaiting, decision, commit } =
-          yield* serveBehindStuckDecision(true);
-        const reply = yield* request("POST", HOLD, "maintain", {
-          phase: "cutover",
-          generation: 0,
-        }).pipe(Effect.forkScoped);
-        yield* Deferred.await(barrierWaiting);
+        const { request, hold, reply, decision, commit } = yield* holdBehindStuckDecision(
+          true,
+          CUTOVER,
+        );
         expect(yield* hold.status).toMatchObject({ phase: "cutover" });
         yield* request("POST", RELEASE, "maintain");
         yield* Deferred.succeed(commit, undefined);

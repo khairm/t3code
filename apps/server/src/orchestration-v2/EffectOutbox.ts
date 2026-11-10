@@ -207,7 +207,7 @@ export interface EffectOutboxV2Shape {
   readonly listByCommandId: (
     commandId: CommandId,
   ) => Effect.Effect<ReadonlyArray<OrchestrationEffectV2>, EffectOutboxError>;
-  /** fork:model-allowlist: threads with an `effectType` effect running, or pending and due. */
+  /** fork:model-allowlist: threads with an `effectType` effect running or pending, a retry's backoff included. */
   readonly threadIdsDelivering: (
     effectType: OrchestrationEffectRequestV2["type"],
   ) => Effect.Effect<ReadonlyArray<ThreadId>, EffectOutboxError>;
@@ -442,11 +442,9 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
         ),
       threadIdsDelivering: Effect.fn("EffectOutbox.threadIdsDelivering")(
         function* (effectType) {
-          const now = DateTime.formatIso(yield* DateTime.now);
           const rows = yield* sql<{ readonly thread_id: string }>`
             SELECT DISTINCT thread_id FROM orchestration_v2_effect_outbox
-            WHERE effect_type = ${effectType}
-              AND (status = 'running' OR (status = 'pending' AND available_at <= ${now}))
+            WHERE effect_type = ${effectType} AND status IN ('pending', 'running')
           `.pipe(NodeSqliteClient.readOnly);
           return rows.map((row) => ThreadId.make(row.thread_id));
         },

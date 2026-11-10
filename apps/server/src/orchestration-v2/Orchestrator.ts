@@ -790,19 +790,6 @@ function isQueuedIdleCompaction(
   );
 }
 
-function isClientSend(
-  message: Pick<
-    OrchestrationV2ConversationMessage,
-    "createdBy" | "creationSource" | "scheduledTaskId"
-  >,
-): boolean {
-  return (
-    message.createdBy === "user" &&
-    (message.creationSource === "web" || message.creationSource === "mobile") &&
-    message.scheduledTaskId === undefined
-  );
-}
-
 type HeldMessage = Pick<
   OrchestrationV2ConversationMessage,
   "createdBy" | "creationSource" | "scheduledTaskId" | "senderThreadId"
@@ -814,10 +801,10 @@ type HeldMessage = Pick<
  */
 function isOwnerSend(message: HeldMessage): boolean {
   return (
-    isClientSend(message) ||
-    (message.creationSource === "mcp" &&
-      message.senderThreadId === undefined &&
-      message.scheduledTaskId === undefined)
+    message.scheduledTaskId === undefined &&
+    ((message.createdBy === "user" &&
+      (message.creationSource === "web" || message.creationSource === "mobile")) ||
+      (message.creationSource === "mcp" && message.senderThreadId === undefined))
   );
 }
 
@@ -5914,9 +5901,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       return;
     }
 
-    const sentByUserFromClient = isClientSend(command);
     // fork:model-allowlist: the owner's message makes a compaction the restart hold queued pointless.
-    if (sentByUserFromClient) {
+    if (isOwnerSend(command)) {
       const compactions = projection.runs.filter((run) => isQueuedIdleCompaction(projection, run));
       for (const run of compactions) {
         yield* dispatchQueuedRunCancel(
@@ -5990,6 +5976,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     // Client messages resume held queues; server continuations and scheduled tasks do not.
     // Provider failure or usage limits re-hold the queue.
     const worktreeSetupUnresolved = worktreeSetupPending(projection);
+    const sentByUserFromClient =
+      command.createdBy === "user" &&
+      (command.creationSource === "web" || command.creationSource === "mobile") &&
+      command.scheduledTaskId === undefined;
     const heldRunsToRelease =
       sentByUserFromClient && startsOrQueuesRun && !worktreeSetupUnresolved
         ? projection.runs.filter((run) => run.status === "queued" && run.queueHeld === true)

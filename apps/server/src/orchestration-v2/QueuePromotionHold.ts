@@ -20,7 +20,7 @@ import {
   backgroundWorkHoldsCompletion,
   derivePendingBackgroundWork,
 } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
-import { latestUnheldRun } from "@t3tools/shared/orchestrationV2ThreadError";
+import { latestExecutedRun } from "@t3tools/shared/orchestrationV2ThreadError";
 
 import { isActiveRun } from "./CommandPolicy.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
@@ -64,7 +64,7 @@ export class QueuePromotionHoldStaleError extends Data.TaggedError("QueuePromoti
   }
 }
 
-/** The hold is set, but a start decision taken before it has not committed within the limit. */
+/** The hold is in `phase`, but a start decision taken before it has not committed within the limit. */
 export class QueuePromotionHoldLockWaitError extends Data.TaggedError(
   "QueuePromotionHoldLockWaitError",
 )<{ readonly phase: QueuePromotionHoldPhase }> {
@@ -78,8 +78,8 @@ export interface QueuePromotionHoldShape {
   /** Null when not held. Read under the thread's dispatch lock, so the hold can wait out a decision. */
   readonly phase: Effect.Effect<QueuePromotionHoldPhase | null>;
   /**
-   * How many threads a T3 stop would cut: one with a live run, background work that keeps the chat
-   * "Working" or still runs in a turn, or an accepted response the provider has not received.
+   * How many threads a T3 stop would cut: one with a live run, awaited background work or a
+   * background step still running, or an accepted response the provider has not received.
    */
   readonly busy: Effect.Effect<number>;
   /** Sets a drain hold, or refreshes the current hold's expiry in its phase; replies once every earlier start decision has committed. */
@@ -88,7 +88,8 @@ export interface QueuePromotionHoldShape {
   readonly drain: Effect.Effect<QueuePromotionHoldStatus, QueuePromotionHoldLockWaitError>;
   /**
    * Moves the hold of `generation` to cutover. Once earlier decisions have committed, every queued
-   * run the owner does not hold is marked `heldForRestart`, then the hold is checked again.
+   * run the owner does not hold is marked `heldForRestart`, then the hold is checked again. If they
+   * have not committed within the wait, the hold goes back to drain and the cutover fails.
    */
   readonly cutover: (
     generation: number,
@@ -305,28 +306,38 @@ const make = Effect.gen(function* () {
   const cutover = Effect.fn("QueuePromotionHold.cutover")(function* (generation: number) {
     const accepts = (status: QueuePromotionHoldStatus, now: DateTime.Utc): status is Held =>
       status.held && status.generation === generation && !expired(status, now);
+    const inCutover = (status: QueuePromotionHoldStatus, now: DateTime.Utc) =>
+      accepts(status, now) && status.phase === "cutover";
     const { before, after } = yield* transition(({ status }, now) =>
       accepts(status, now) ? held(status, "cutover", now) : null,
     );
     if (after === before) {
       return yield* new QueuePromotionHoldStaleError({ generation, status: after.status });
     }
-    yield* withinLockWait(Effect.andThen(earlierDecisions, markEveryQueuedRun), () =>
-      Effect.fail(new QueuePromotionHoldLockWaitError({ phase: "cutover" })),
-    );
+    const backToDrain = Effect.gen(function* () {
+      const { before, after } = yield* transition(({ status }, now) =>
+        inCutover(status, now) ? held(status, "drain", now) : null,
+      );
+      if (after === before) {
+        return yield* new QueuePromotionHoldStaleError({ generation, status: after.status });
+      }
+      yield* publishReleases;
+      return yield* new QueuePromotionHoldLockWaitError({ phase: "drain" });
+    });
+    yield* withinLockWait(Effect.andThen(earlierDecisions, markEveryQueuedRun), () => backToDrain);
     // Checked again: a release, an expiry or a drain while the barrier waited refuses the cutover.
     const now = yield* DateTime.now;
     const current = yield* status;
-    if (!accepts(current, now) || current.phase !== "cutover") {
+    if (!inCutover(current, now)) {
       return yield* new QueuePromotionHoldStaleError({ generation, status: current });
     }
     return current;
   });
 
-  const busyIn = Effect.fnUntraced(function* (threadId: ThreadId, delivering: boolean) {
+  const busyIn = Effect.fnUntraced(function* (threadId: ThreadId) {
     const { runs } = yield* projections.getThreadRecords(threadId, ["runs"]);
     // A waiting run's agent turn is over; what it still waits on is read below, as after any run.
-    if (delivering || runs.some((run) => isActiveRun(run) && run.status !== "waiting")) return true;
+    if (runs.some((run) => isActiveRun(run) && run.status !== "waiting")) return true;
     const { thread, providerThreads, turnItems } = yield* projections.getThreadRecords(
       threadId,
       ["providerThreads", "turnItems"],
@@ -336,7 +347,7 @@ const make = Effect.gen(function* () {
       turnItems.some(isCutBackgroundItem) ||
       backgroundWorkHoldsCompletion(
         derivePendingBackgroundWork({
-          latestRun: latestUnheldRun(runs),
+          latestRun: latestExecutedRun(runs),
           providerThreads,
           turnItems,
           activeProviderThreadId: thread.activeProviderThreadId,
@@ -347,11 +358,13 @@ const make = Effect.gen(function* () {
   });
   const busy = Effect.gen(function* () {
     const delivering = new Set(yield* outbox.threadIdsDelivering("runtime-request.respond"));
-    const threads = yield* Effect.forEach(
-      yield* projections.getRecoveryThreadIds("runtime"),
-      (threadId) => busyIn(threadId, delivering.has(threadId)),
+    const others = yield* Effect.forEach(
+      (yield* projections.getRecoveryThreadIds("runtime")).filter(
+        (threadId) => !delivering.has(threadId),
+      ),
+      busyIn,
     );
-    return threads.filter(Boolean).length;
+    return delivering.size + others.filter(Boolean).length;
   }).pipe(Effect.orDie);
 
   return QueuePromotionHold.of({
