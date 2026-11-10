@@ -1,3 +1,7 @@
 # <marker> <file>. The marker must stay in its file, and only these files may differ from upstream.
 fork:paired-session-ttl apps/server/src/auth/EnvironmentAuth.ts
 fork:paired-session-ttl apps/server/src/auth/EnvironmentAuth.test.ts
+fork:helper-background-hold packages/shared/src/orchestrationV2PendingBackgroundWork.ts
+fork:helper-background-hold packages/shared/src/orchestrationV2PendingBackgroundWork.test.ts
+fork:helper-background-hold apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts
+fork:helper-background-hold docs/user/thread-sidebar.md

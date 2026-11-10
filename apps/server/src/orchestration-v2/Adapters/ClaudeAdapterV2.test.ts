@@ -9945,7 +9945,8 @@ describe("ClaudeAdapterV2 background wake turns", () => {
                 event.providerThread.pendingBackgroundTasks?.[0]?.parentTaskId === "agent-1",
             ),
           );
-          // The helper ends its turn while its shell runs; the shell still holds the thread.
+          // fork:helper-background-hold: the helper ends its turn while its shell runs; the
+          // shell still holds the thread.
           yield* harness.offerAndWait(
             makeSubagentNotificationFrame({
               taskId: "agent-1",

@@ -135,6 +135,7 @@ open.
 
 Threads that are working or waiting on work they will resume from move into a collapsed
 **Working** section below the active list.
+<!-- fork:helper-background-hold -->
 That includes subagents and any commands they leave running, watched pull requests, and background
 commands or monitors the agent says it is waiting on. A dev server or other process the thread's own
 agent leaves running does not keep a thread there. A thread returns to the top of the active list

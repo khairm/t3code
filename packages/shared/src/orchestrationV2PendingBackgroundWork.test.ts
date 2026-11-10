@@ -12,6 +12,7 @@ describe("backgroundWorkHoldsCompletion", () => {
     ["a command the agent waits on", true, [{ taskId: "tests", kind: "command", awaited: true }]],
     ["a subagent", true, [{ taskId: "review", kind: "subagent" }]],
     [
+      // fork:helper-background-hold
       "a subagent's own command",
       true,
       [{ taskId: "tests", kind: "command", parentTaskId: "review" }],

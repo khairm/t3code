@@ -92,7 +92,8 @@ export function backgroundWorkHoldsCompletion(
   return tasks.some(
     (task) =>
       task.awaited === true ||
-      // A subagent that ends its turn on its own background work is still working.
+      // fork:helper-background-hold: a subagent that ends its turn on its own background
+      // work is still working.
       task.parentTaskId !== undefined ||
       backgroundWorkKindHoldsCompletion(task.kind),
   );
