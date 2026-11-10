@@ -118,6 +118,17 @@ function isAppOwnedDelegationItem(
   return item.type === "subagent" && isAppOwnedDelegation(item);
 }
 
+/** Background work a server stop cuts short, which recovery cancels at the next startup. */
+export function isCutBackgroundItem(
+  item: OrchestrationV2ThreadProjection["turnItems"][number],
+): boolean {
+  return (
+    isBackgroundCapableTurnItemType(item.type) &&
+    isNonterminalTurnItemStatus(item.status) &&
+    !isAppOwnedDelegationItem(item)
+  );
+}
+
 function providerThreadHasPendingBackgroundTasks(
   providerThread: OrchestrationV2ThreadProjection["providerThreads"][number],
 ): boolean {
@@ -521,10 +532,7 @@ export const make = Effect.gen(function* () {
         if (item.runId !== null && recoveredNonterminalRunIds.has(item.runId)) {
           continue;
         }
-        if (!isBackgroundCapableTurnItemType(item.type)) {
-          continue;
-        }
-        if (!isNonterminalTurnItemStatus(item.status) || isAppOwnedDelegationItem(item)) {
+        if (!isCutBackgroundItem(item)) {
           continue;
         }
         const providerInstanceId = resolveStaleBackgroundItemProviderInstanceId(item, projection);

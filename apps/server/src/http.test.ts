@@ -37,8 +37,11 @@ import {
 
 import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
 import * as ServerConfig from "./config.ts";
+import * as EventSink from "./orchestration-v2/EventSink.ts";
+import * as ProjectionStore from "./orchestration-v2/ProjectionStore.ts";
 import * as QueuePromotionHold from "./orchestration-v2/QueuePromotionHold.ts";
 import * as ThreadCommandExecutor from "./orchestration-v2/ThreadCommandExecutor.ts";
+import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as KeyedLock from "@t3tools/shared/KeyedLock";
 
 import { assetResponseHeaders, assetFileResponse, downloadContentDisposition } from "./http.ts";
@@ -869,6 +872,7 @@ describe("downloadContentDisposition", () => {
 
 // fork:model-allowlist
 describe("queue promotion hold routes", () => {
+  const notHeld = (generation: number) => ({ held: false, generation, busy: 0 });
   const layerAuth = Layer.mock(EnvironmentAuth.EnvironmentAuth)({
     authenticateHttpRequest: (request) => {
       const token = request.headers.authorization?.replace(/^Bearer /, "");
@@ -900,6 +904,14 @@ describe("queue promotion hold routes", () => {
         Layer.provideMerge(QueuePromotionHold.layer),
         Layer.provideMerge(layerThreadLocks),
         Layer.provide(layerAuth),
+        // No thread runs or queues here; the hold's run marking and busy count are covered with real stores.
+        Layer.provide(
+          Layer.mock(ProjectionStore.ProjectionStoreV2)({
+            getRecoveryThreadIds: () => Effect.succeed([]),
+          }),
+        ),
+        Layer.provide(Layer.mock(EventSink.EventSinkV2)({})),
+        Layer.provide(IdAllocator.layer),
         Layer.provideMerge(NodeHttpServer.layerTest),
       ),
     );
@@ -957,7 +969,7 @@ describe("queue promotion hold routes", () => {
         const { request } = yield* serveHoldRoutes();
         const held = yield* request("POST", HOLD, "maintain");
         expect(held.status).toBe(200);
-        expect(held.body).toMatchObject({ held: true, phase: "drain", generation: seed });
+        expect(held.body).toMatchObject({ held: true, phase: "drain", generation: seed, busy: 0 });
         const { heldSince, expiresAt } = held.body;
         expect(typeof heldSince).toBe("string");
 
@@ -974,14 +986,8 @@ describe("queue promotion hold routes", () => {
         ).toBe(10 * 60_000);
         expect((yield* request("GET", HOLD, "maintain")).body).toEqual(refreshed.body);
 
-        expect((yield* request("POST", RELEASE, "maintain")).body).toEqual({
-          held: false,
-          generation: seed + 1,
-        });
-        expect((yield* request("GET", HOLD, "maintain")).body).toEqual({
-          held: false,
-          generation: seed + 1,
-        });
+        expect((yield* request("POST", RELEASE, "maintain")).body).toEqual(notHeld(seed + 1));
+        expect((yield* request("GET", HOLD, "maintain")).body).toEqual(notHeld(seed + 1));
       }).pipe(Effect.provide(NodeServices.layer)),
   );
 
@@ -1031,10 +1037,7 @@ describe("queue promotion hold routes", () => {
       yield* request("POST", HOLD, "maintain");
       yield* request("POST", HOLD, "maintain", { phase: "cutover", generation: 0 });
       yield* TestClock.adjust("2 minutes");
-      expect((yield* request("GET", HOLD, "maintain")).body).toEqual({
-        held: false,
-        generation: 1,
-      });
+      expect((yield* request("GET", HOLD, "maintain")).body).toEqual(notHeld(1));
     }).pipe(Effect.provide(NodeServices.layer)),
   );
 
@@ -1057,10 +1060,7 @@ describe("queue promotion hold routes", () => {
           generation: 0,
         });
         yield* TestClock.adjust("28 minutes");
-        expect((yield* request("GET", HOLD, "maintain")).body).toEqual({
-          held: false,
-          generation: 1,
-        });
+        expect((yield* request("GET", HOLD, "maintain")).body).toEqual(notHeld(1));
       }).pipe(Effect.provide(NodeServices.layer)),
   );
 
@@ -1160,15 +1160,32 @@ describe("queue promotion hold routes", () => {
         yield* serveBehindStuckDecision(true);
       const released = yield* hold.releases.pipe(Stream.runHead, Effect.forkScoped);
       yield* Effect.yieldNow;
-      expect((yield* request("POST", RELEASE, "maintain")).body).toEqual({
-        held: false,
-        generation: 1,
-      });
+      expect((yield* request("POST", RELEASE, "maintain")).body).toEqual(notHeld(1));
       yield* Deferred.await(barrierWaiting);
       expect(released.pollUnsafe()).toBeUndefined();
       yield* Deferred.succeed(commit, undefined);
       yield* Fiber.join(decision);
       yield* Fiber.join(released);
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("emits a release again for a decision that outlived the 20-second wait", () =>
+    Effect.gen(function* () {
+      const { request, hold, barrierWaiting, decision, commit } =
+        yield* serveBehindStuckDecision(true);
+      const releases = yield* hold.releases.pipe(
+        Stream.take(2),
+        Stream.runCount,
+        Effect.forkScoped,
+      );
+      yield* Effect.yieldNow;
+      yield* request("POST", RELEASE, "maintain");
+      yield* Deferred.await(barrierWaiting);
+      yield* TestClock.adjust("20 seconds");
+      expect(releases.pollUnsafe()).toBeUndefined();
+      yield* Deferred.succeed(commit, undefined);
+      yield* Fiber.join(decision);
+      expect(yield* Fiber.join(releases)).toBe(2);
     }).pipe(Effect.provide(NodeServices.layer)),
   );
 

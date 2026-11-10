@@ -403,26 +403,17 @@ const decodeQueuePromotionHoldRequest = Schema.decodeEffect(
   Schema.fromJsonString(QueuePromotionHoldRequest),
 );
 
-const queuePromotionStatusJson = (status: QueuePromotionHold.QueuePromotionHoldStatus) =>
-  HttpServerResponse.jsonUnsafe(
-    status.held
-      ? {
-          ...status,
-          heldSince: DateTime.formatIso(status.heldSince),
-          expiresAt: DateTime.formatIso(status.expiresAt),
-        }
-      : status,
-  );
 const queuePromotionErrorJson = (status: number, error: string, message: string) =>
   HttpServerResponse.jsonUnsafe({ error, message }, { status });
 
+/** Every status body carries `busy`: the runs a T3 stop would cut, which the restart waits to see at 0. */
 const queuePromotionRoute = (
   method: "GET" | "POST",
   path: HttpRouter.PathInput,
   handle: (
     hold: QueuePromotionHold.QueuePromotionHoldShape,
   ) => Effect.Effect<
-    HttpServerResponse.HttpServerResponse,
+    QueuePromotionHold.QueuePromotionHoldStatus,
     | QueuePromotionHold.QueuePromotionHoldLockWaitError
     | QueuePromotionHold.QueuePromotionHoldStaleError
     | Schema.SchemaError,
@@ -434,7 +425,18 @@ const queuePromotionRoute = (
     path,
     Effect.gen(function* () {
       yield* authenticateRawRouteWithScope(AuthEnvironmentMaintainScope);
-      return yield* handle(yield* QueuePromotionHold.QueuePromotionHold);
+      const hold = yield* QueuePromotionHold.QueuePromotionHold;
+      const status = yield* handle(hold);
+      return HttpServerResponse.jsonUnsafe({
+        ...(status.held
+          ? {
+              ...status,
+              heldSince: DateTime.formatIso(status.heldSince),
+              expiresAt: DateTime.formatIso(status.expiresAt),
+            }
+          : status),
+        busy: yield* hold.busy,
+      });
     }).pipe(
       Effect.catchTags({
         EnvironmentAuthInvalidError: HttpServerRespondable.toResponse,
@@ -461,24 +463,22 @@ export const layerHoldQueuePromotionRoute = queuePromotionRoute(
     const request = yield* HttpServerRequest.HttpServerRequest;
     const text = yield* request.text.pipe(Effect.orDie);
     const body = yield* decodeQueuePromotionHoldRequest(text.trim() === "" ? "{}" : text);
-    return queuePromotionStatusJson(
-      yield* body.phase === "cutover"
-        ? hold.cutover(body.generation)
-        : body.phase === "drain"
-          ? hold.drain
-          : hold.hold,
-    );
+    return yield* body.phase === "cutover"
+      ? hold.cutover(body.generation)
+      : body.phase === "drain"
+        ? hold.drain
+        : hold.hold;
   }),
 );
 export const layerReleaseQueuePromotionRoute = queuePromotionRoute(
   "POST",
   RELEASE_QUEUE_PROMOTION_PATH,
-  (hold) => Effect.andThen(hold.release, Effect.map(hold.status, queuePromotionStatusJson)),
+  (hold) => Effect.andThen(hold.release, hold.status),
 );
 export const layerQueuePromotionStatusRoute = queuePromotionRoute(
   "GET",
   HOLD_QUEUE_PROMOTION_PATH,
-  (hold) => Effect.map(hold.status, queuePromotionStatusJson),
+  (hold) => hold.status,
 );
 
 const UNTRACED_REQUEST_PATHS: ReadonlySet<string> = new Set([OTLP_TRACES_PROXY_PATH]);

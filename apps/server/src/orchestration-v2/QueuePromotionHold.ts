@@ -2,6 +2,8 @@
 // Drain: T3's own starts wait as queued runs marked heldForRestart; the owner's sends and clicks,
 // and starts caused by a still-active run, go through. Cutover: every start waits. Release, expiry
 // or the restarted server starts what waited. A generation ties a cutover to its hold.
+import type { OrchestrationV2Run, ThreadId } from "@t3tools/contracts";
+import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Data from "effect/Data";
@@ -11,10 +13,13 @@ import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as PubSub from "effect/PubSub";
-import * as Ref from "effect/Ref";
 import * as Stream from "effect/Stream";
 import * as SynchronizedRef from "effect/SynchronizedRef";
 
+import { isActiveRun } from "./CommandPolicy.ts";
+import * as EventSink from "./EventSink.ts";
+import * as ProjectionStore from "./ProjectionStore.ts";
+import { isCutBackgroundItem } from "./ProviderRuntimeRecoveryService.ts";
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 
 const DRAIN_EXPIRY = Duration.minutes(30);
@@ -65,11 +70,16 @@ export interface QueuePromotionHoldShape {
   readonly status: Effect.Effect<QueuePromotionHoldStatus>;
   /** Null when not held. Read under the thread's dispatch lock, so the hold can wait out a decision. */
   readonly phase: Effect.Effect<QueuePromotionHoldPhase | null>;
+  /** How many runs a T3 stop would cut: preparing, starting, running, or waiting on background work. */
+  readonly busy: Effect.Effect<number>;
   /** Sets a drain hold, or refreshes the current hold's expiry in its phase; replies once every earlier start decision has committed. */
   readonly hold: Effect.Effect<QueuePromotionHoldStatus, QueuePromotionHoldLockWaitError>;
   /** Like `hold`, and brings a cutover back to drain, starting what drain allows. */
   readonly drain: Effect.Effect<QueuePromotionHoldStatus, QueuePromotionHoldLockWaitError>;
-  /** Moves the hold of `generation` to cutover, checked again once earlier decisions have committed. */
+  /**
+   * Moves the hold of `generation` to cutover. Once earlier decisions have committed, every queued
+   * run the owner does not hold is marked `heldForRestart`, then the hold is checked again.
+   */
   readonly cutover: (
     generation: number,
   ) => Effect.Effect<
@@ -79,6 +89,16 @@ export interface QueuePromotionHoldShape {
   readonly release: Effect.Effect<void>;
   /** Emits once runs the hold kept may start: after a release, an expiry, or a cutover brought back to drain. */
   readonly releases: Stream.Stream<void>;
+  /** Marks the queued runs of `runs` the owner does not hold as kept by the hold. The caller holds the thread's lock. */
+  readonly markQueuedRuns: (
+    threadId: ThreadId,
+    runs: ReadonlyArray<OrchestrationV2Run>,
+  ) => Effect.Effect<void, EventSink.EventSinkV2Error | IdAllocator.IdAllocatorV2Error>;
+  /** Clears the mark from the queued runs of `runs`, once no hold is in effect. The caller holds the thread's lock. */
+  readonly unmarkQueuedRuns: (
+    threadId: ThreadId,
+    runs: ReadonlyArray<OrchestrationV2Run>,
+  ) => Effect.Effect<void, EventSink.EventSinkV2Error | IdAllocator.IdAllocatorV2Error>;
 }
 
 export class QueuePromotionHold extends Context.Service<
@@ -87,64 +107,63 @@ export class QueuePromotionHold extends Context.Service<
 >()("t3/orchestration-v2/QueuePromotionHold") {}
 
 type Held = Extract<QueuePromotionHoldStatus, { held: true }>;
-/** The revision rises on every transition, so an expiry watcher clears only the state it read. */
+/**
+ * The revision rises on every transition, so an expiry watcher clears only the state it read; the
+ * watcher is installed in the same transition, so a stale one never outlives a newer state.
+ */
 interface State {
   readonly revision: number;
   readonly status: QueuePromotionHoldStatus;
+  readonly watcher: Fiber.Fiber<void> | null;
 }
 
 const expired = (status: Held, now: DateTime.Utc) =>
   DateTime.isGreaterThanOrEqualTo(now, status.expiresAt);
 
+const BACKGROUND_TURN_ITEM_TYPES = ["command_execution", "dynamic_tool", "subagent"] as const;
+
 const make = Effect.gen(function* () {
   const threadLocks = yield* ThreadCommandExecutor.ThreadCommandExecutor;
+  const projections = yield* ProjectionStore.ProjectionStoreV2;
+  const eventSink = yield* EventSink.EventSinkV2;
+  const ids = yield* IdAllocator.IdAllocatorV2;
   const scope = yield* Effect.scope;
   // Seeded per process, so a cutover named before a restart is refused after it.
   const stateRef = yield* SynchronizedRef.make<State>({
     revision: 0,
     status: { held: false, generation: yield* Clock.currentTimeMillis },
+    watcher: null,
   });
-  const watcherRef = yield* Ref.make<Fiber.Fiber<void> | null>(null);
   const releasesPubSub = yield* PubSub.unbounded<void>();
   const status = Effect.map(SynchronizedRef.get(stateRef), (state) => state.status);
 
-  /** One atomic transition; `decide` returns the status to move to, or null to leave the state alone. */
+  /**
+   * One atomic transition; `decide` returns the status to move to, or null to leave the state
+   * alone. A held status gets its expiry watcher here, replacing the previous one. The watcher
+   * only sleeps, and forks the expiry, so interrupting it never cuts an expiry short.
+   */
   const transition = (
     decide: (state: State, now: DateTime.Utc) => QueuePromotionHoldStatus | null,
-  ) =>
+  ): Effect.Effect<{ readonly before: State; readonly after: State }> =>
     Effect.flatMap(DateTime.now, (now) =>
-      SynchronizedRef.modify(stateRef, (before) => {
-        const next = decide(before, now);
-        const after = next === null ? before : { revision: before.revision + 1, status: next };
-        return [{ before, after }, after];
-      }),
+      SynchronizedRef.modifyEffect(stateRef, (before) =>
+        Effect.gen(function* () {
+          const next = decide(before, now);
+          if (next === null) return [{ before, after: before }, before] as const;
+          const revision = before.revision + 1;
+          const watcher = next.held
+            ? yield* Effect.sleep(DateTime.distance(now, next.expiresAt)).pipe(
+                Effect.andThen(Effect.forkIn(clear(revision), scope)),
+                Effect.asVoid,
+                Effect.forkIn(scope),
+              )
+            : null;
+          if (before.watcher !== null) yield* Fiber.interrupt(before.watcher);
+          const after: State = { revision, status: next, watcher };
+          return [{ before, after }, after] as const;
+        }),
+      ),
     );
-
-  // Decisions run under their thread's lock, so one taken before a transition has committed once
-  // that lock is free.
-  const awaitEarlierDecisions = <E>(orElse: () => Effect.Effect<void, E>) =>
-    Effect.flatMap(threadLocks.activeKeys, (lockedThreads) =>
-      Effect.forEach(lockedThreads, (threadId) => threadLocks.withLock(threadId, Effect.void), {
-        concurrency: "unbounded",
-        discard: true,
-      }),
-    ).pipe(Effect.timeoutOrElse({ duration: QUEUE_PROMOTION_HOLD_LOCK_WAIT, orElse }));
-  /** Published once decisions taken while held have committed, so the sweep finds their runs. */
-  const publishReleases = awaitEarlierDecisions(() =>
-    Effect.logWarning("A run start decided under the queue promotion hold is still committing"),
-  ).pipe(Effect.andThen(PubSub.publish(releasesPubSub, undefined)), Effect.forkIn(scope));
-
-  const held = (
-    status: QueuePromotionHoldStatus,
-    phase: QueuePromotionHoldPhase,
-    now: DateTime.Utc,
-  ): Held => ({
-    held: true,
-    phase,
-    generation: status.generation,
-    heldSince: status.held ? status.heldSince : now,
-    expiresAt: DateTime.addDuration(now, phase === "cutover" ? CUTOVER_EXPIRY : DRAIN_EXPIRY),
-  });
 
   /** Releases the current hold; with `revision`, only the state the expiry watcher read. */
   const clear = Effect.fnUntraced(function* (revision?: number) {
@@ -168,16 +187,41 @@ const make = Effect.gen(function* () {
     yield* publishReleases;
   });
 
-  /** One watcher sleeps at a time; a transition replaces the previous one. */
-  const watchExpiry = Effect.fn("QueuePromotionHold.watchExpiry")(function* (
-    state: State,
-    expiresAt: DateTime.Utc,
-  ) {
-    const watcher = yield* Effect.flatMap(DateTime.now, (now) =>
-      Effect.sleep(DateTime.distance(now, expiresAt)),
-    ).pipe(Effect.andThen(clear(state.revision)), Effect.forkIn(scope));
-    const previous = yield* Ref.getAndSet(watcherRef, watcher);
-    if (previous !== null) yield* Fiber.interrupt(previous);
+  // Decisions run under their thread's lock, so one taken before a transition has committed once
+  // that lock is free.
+  const earlierDecisions = Effect.flatMap(threadLocks.activeKeys, (lockedThreads) =>
+    Effect.forEach(lockedThreads, (threadId) => threadLocks.withLock(threadId, Effect.void), {
+      concurrency: "unbounded",
+      discard: true,
+    }),
+  );
+  const withinLockWait = <A, E1, E2>(
+    effect: Effect.Effect<A, E1>,
+    orElse: () => Effect.Effect<A, E2>,
+  ) => effect.pipe(Effect.timeoutOrElse({ duration: QUEUE_PROMOTION_HOLD_LOCK_WAIT, orElse }));
+  const awaitEarlierDecisions = <E>(orElse: () => Effect.Effect<void, E>) =>
+    withinLockWait(earlierDecisions, orElse);
+  const publish = PubSub.publish(releasesPubSub, undefined);
+  /**
+   * Published once decisions taken while held have committed, so the sweep finds their runs. A
+   * decision still committing after the wait gets its own publish once it has.
+   */
+  const publishReleases = awaitEarlierDecisions(() =>
+    Effect.logWarning(
+      "A run start decided under the queue promotion hold is still committing",
+    ).pipe(Effect.andThen(publish), Effect.andThen(earlierDecisions)),
+  ).pipe(Effect.andThen(publish), Effect.forkIn(scope));
+
+  const held = (
+    status: QueuePromotionHoldStatus,
+    phase: QueuePromotionHoldPhase,
+    now: DateTime.Utc,
+  ): Held => ({
+    held: true,
+    phase,
+    generation: status.generation,
+    heldSince: status.held ? status.heldSince : now,
+    expiresAt: DateTime.addDuration(now, phase === "cutover" ? CUTOVER_EXPIRY : DRAIN_EXPIRY),
   });
 
   /** `current` keeps the phase of a held hold; `drain` also brings a cutover back to drain. */
@@ -186,7 +230,6 @@ const make = Effect.gen(function* () {
       held(status, !status.held || requested === "drain" ? "drain" : status.phase, now),
     );
     const next = after.status as Held;
-    yield* watchExpiry(after, next.expiresAt);
     if (!before.status.held) {
       yield* Effect.logInfo("Queue promotion held until the server restarts", {
         generation: next.generation,
@@ -198,6 +241,55 @@ const make = Effect.gen(function* () {
     return next;
   });
 
+  const writeRunUpdates = Effect.fnUntraced(function* (
+    threadId: ThreadId,
+    runs: ReadonlyArray<OrchestrationV2Run>,
+    update: (run: OrchestrationV2Run) => OrchestrationV2Run,
+  ) {
+    if (runs.length === 0) return;
+    const now = yield* DateTime.now;
+    const events = yield* Effect.forEach(runs, (run) =>
+      Effect.map(ids.allocate.event({ threadId }), (id) => ({
+        id,
+        type: "run.updated" as const,
+        threadId,
+        runId: run.id,
+        providerInstanceId: run.providerInstanceId,
+        occurredAt: now,
+        payload: update(run),
+      })),
+    );
+    yield* eventSink.write({ events });
+  });
+  const markQueuedRuns: QueuePromotionHoldShape["markQueuedRuns"] = (threadId, runs) =>
+    writeRunUpdates(
+      threadId,
+      runs.filter(
+        (run) => run.status === "queued" && run.queueHeld !== true && run.heldForRestart !== true,
+      ),
+      (run) => ({ ...run, heldForRestart: true }),
+    );
+  const unmarkQueuedRuns: QueuePromotionHoldShape["unmarkQueuedRuns"] = (threadId, runs) =>
+    writeRunUpdates(
+      threadId,
+      runs.filter((run) => run.status === "queued" && run.heldForRestart === true),
+      ({ heldForRestart: _heldForRestart, ...run }) => run,
+    );
+  // The runtime set is every thread with a queued run the owner does not hold, idle or not.
+  const markEveryQueuedRun = Effect.flatMap(
+    projections.getRecoveryThreadIds("runtime"),
+    Effect.forEach(
+      (threadId) =>
+        threadLocks.withLock(
+          threadId,
+          Effect.flatMap(projections.getThreadRecords(threadId, ["runs"]), ({ runs }) =>
+            markQueuedRuns(threadId, runs),
+          ),
+        ),
+      { discard: true },
+    ),
+  ).pipe(Effect.orDie);
+
   const cutover = Effect.fn("QueuePromotionHold.cutover")(function* (generation: number) {
     const accepts = (status: QueuePromotionHoldStatus, now: DateTime.Utc): status is Held =>
       status.held && status.generation === generation && !expired(status, now);
@@ -207,8 +299,7 @@ const make = Effect.gen(function* () {
     if (after === before) {
       return yield* new QueuePromotionHoldStaleError({ generation, status: after.status });
     }
-    yield* watchExpiry(after, (after.status as Held).expiresAt);
-    yield* awaitEarlierDecisions(() =>
+    yield* withinLockWait(Effect.andThen(earlierDecisions, markEveryQueuedRun), () =>
       Effect.fail(new QueuePromotionHoldLockWaitError({ phase: "cutover" })),
     );
     // Checked again: a release, an expiry or a drain while the barrier waited refuses the cutover.
@@ -220,14 +311,41 @@ const make = Effect.gen(function* () {
     return current;
   });
 
+  /** Active runs, less those waiting on the user with no background work a stop would cut. */
+  const busyIn = Effect.fnUntraced(function* (threadId: ThreadId) {
+    const active = (yield* projections.getThreadRecords(threadId, ["runs"])).runs.filter(
+      isActiveRun,
+    );
+    const waiting = active.filter((run) => run.status === "waiting");
+    if (waiting.length === 0) return active.length;
+    const { turnItems } = yield* projections.getThreadRecords(threadId, ["turnItems"], {
+      turnItemTypes: BACKGROUND_TURN_ITEM_TYPES,
+      turnItemRunIds: waiting.map((run) => run.id),
+    });
+    const idle = waiting.filter(
+      (run) => !turnItems.some((item) => item.runId === run.id && isCutBackgroundItem(item)),
+    );
+    return active.length - idle.length;
+  });
+  const busy = Effect.flatMap(
+    projections.getRecoveryThreadIds("runtime"),
+    Effect.forEach(busyIn),
+  ).pipe(
+    Effect.map((counts) => counts.reduce((total, count) => total + count, 0)),
+    Effect.orDie,
+  );
+
   return QueuePromotionHold.of({
     status,
     phase: Effect.map(status, (current) => (current.held ? current.phase : null)),
+    busy,
     hold: holdIn("current"),
     drain: holdIn("drain"),
     cutover,
     release: clear(),
     releases: Stream.fromPubSub(releasesPubSub),
+    markQueuedRuns,
+    unmarkQueuedRuns,
   });
 });
 

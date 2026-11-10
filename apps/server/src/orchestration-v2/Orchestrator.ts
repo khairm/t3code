@@ -23,6 +23,7 @@ import {
   type ChatAttachment,
   CommandId,
   type GuestMessageId,
+  idleCompactionOf,
   isCompactionCommandMessage,
   isOrchestrationV2WorkActive,
   isProviderNativeSubagentThread,
@@ -774,6 +775,19 @@ function nextQueuedRun(
   projection: Pick<OrchestrationV2ThreadProjection, "runs" | "messages">,
 ): OrchestrationV2Run | undefined {
   return queuedRunsInDeliveryOrder(projection).find((run) => run.queueHeld !== true);
+}
+
+/** fork:model-allowlist: a compaction T3 sent itself that the restart hold queued. */
+function isQueuedIdleCompaction(
+  projection: Pick<OrchestrationV2ThreadProjection, "messages">,
+  run: OrchestrationV2Run,
+): boolean {
+  return (
+    run.status === "queued" &&
+    projection.messages.some(
+      (message) => message.id === run.userMessageId && idleCompactionOf(message) !== undefined,
+    )
+  );
 }
 
 function isClientSend(
@@ -1610,10 +1624,6 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       message.senderThreadId === undefined || !(yield* senderStillActive(message.senderThreadId))
     );
   });
-  const heldForRestart = Effect.fn("Orchestrator.heldForRestart")(function* (message: HeldMessage) {
-    const phase = yield* promotionHold.phase;
-    return phase !== null && (yield* startKeptForRestart(phase, message));
-  });
   /**
    * Whether the hold keeps the thread's next promotion. While draining, a queued run the drain
    * would let start also starts the runs ahead of it, so the queue keeps its order.
@@ -1625,7 +1635,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     if (phase === null) return false;
     if (phase === "cutover") return true;
     const queuedMessageIds = new Set(
-      projection.runs.filter((run) => run.status === "queued").map((run) => run.userMessageId),
+      projection.runs
+        .filter((run) => run.status === "queued" && run.queueHeld !== true)
+        .map((run) => run.userMessageId),
     );
     const queuedMessages = projection.messages.filter((message) =>
       queuedMessageIds.has(message.id),
@@ -1641,24 +1653,6 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     }
     return true;
   });
-  /** Marks every queued run the restart's recovery must leave to start on its own. */
-  const markQueuedRunsHeldForRestart = Effect.fn("Orchestrator.markQueuedRunsHeldForRestart")(
-    function* (threadId: ThreadId, runs: ReadonlyArray<OrchestrationV2Run>) {
-      const unmarked = runs.filter((run) => run.status === "queued" && run.heldForRestart !== true);
-      if (unmarked.length === 0) return;
-      const now = yield* DateTime.now;
-      yield* writeSystemEvents(
-        unmarked.map((run) => ({
-          type: "run.updated" as const,
-          threadId,
-          runId: run.id,
-          providerInstanceId: run.providerInstanceId,
-          occurredAt: now,
-          payload: { ...run, heldForRestart: true },
-        })),
-      );
-    },
-  );
   /** The run's message is read only while held, as every release pays for it otherwise. */
   const preparedRunHeldForRestart = Effect.fn("Orchestrator.preparedRunHeldForRestart")(function* (
     command: Extract<OrchestrationV2Command, { readonly type: "prepared-run.release" }>,
@@ -1763,7 +1757,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         yield* writeSystemEvents(
           projection.runs
             .filter((run) => run.status === "queued")
-            .map((run) => ({
+            // fork:model-allowlist: the restart hold never marks a queue the owner holds.
+            .map(({ heldForRestart: _heldForRestart, ...run }) => ({
               type: "run.updated" as const,
               threadId,
               runId: run.id,
@@ -1774,9 +1769,16 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         );
         return;
       }
-      // fork:model-allowlist: a promotion the hold keeps waits for the restart's recovery, or a release.
+      // fork:model-allowlist: a promotion the hold keeps waits for the restart's recovery, or a release;
+      // one with no hold in effect clears the marks a hold that ended without a restart left.
       if (options?.byOwner !== true && (yield* promotionKeptForRestart(projection))) {
-        return yield* markQueuedRunsHeldForRestart(threadId, projection.runs);
+        return yield* promotionHold.markQueuedRuns(threadId, projection.runs);
+      }
+      if ((yield* promotionHold.phase) === null) {
+        yield* promotionHold.unmarkQueuedRuns(
+          threadId,
+          projection.runs.filter((run) => run.id !== storedQueuedRun.id),
+        );
       }
       // Move queued ordinals after runs that started while they waited to preserve transcript and checkpoint order.
       // Started runs have prompts; cancelled queued messages do not.
@@ -5898,6 +5900,25 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       return;
     }
 
+    const sentByUserFromClient = isClientSend(command);
+    // fork:model-allowlist: the owner's message makes a compaction the restart hold queued pointless.
+    if (sentByUserFromClient) {
+      const compactions = projection.runs.filter((run) => isQueuedIdleCompaction(projection, run));
+      for (const run of compactions) {
+        yield* dispatchQueuedRunCancel(
+          {
+            type: "queued-run.cancel",
+            commandId: command.commandId,
+            threadId: command.threadId,
+            runId: run.id,
+          },
+          events,
+        );
+      }
+      if (compactions.length > 0) {
+        projection = yield* getProjectionWithPendingEvents(command.threadId, events);
+      }
+    }
     const activeProviderThread = projection.providerThreads.find(
       (candidate) => candidate.id === projection.thread.activeProviderThreadId,
     );
@@ -5920,18 +5941,29 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       dispatchMode.type === "defer_start" ||
       dispatchMode.type === "start_immediately" ||
       dispatchMode.type === "queue_after_active";
-    const sentByUserFromClient = isClientSend(command);
-    // fork:model-allowlist: a start the restart hold keeps queues instead, marked for its recovery;
-    // one it lets through still waits behind the runs it kept on this thread, which then start.
-    // A pending transfer or a usage-limit continuation cannot queue, so those are refused.
-    const wouldStartNow =
+    // fork:model-allowlist: a start the restart hold keeps queues instead, and every run queued
+    // while held is marked for the restart's recovery. A pending transfer or a usage-limit
+    // continuation cannot queue, and a workspace preparation would be cut, so those are refused.
+    const holdPhase = yield* promotionHold.phase;
+    if (
+      holdPhase === "cutover" &&
       queueBehindRun === undefined &&
-      (dispatchMode.type === "start_immediately" || dispatchMode.type === "queue_after_active");
-    const queuedForRestart = wouldStartNow && (yield* heldForRestart(command));
+      dispatchMode.type === "defer_start"
+    ) {
+      return yield* heldForRestartError(command);
+    }
+    // Kept itself, or behind runs the hold kept on this thread; a queued compaction keeps nothing waiting.
     const queuedForHold =
-      queuedForRestart ||
-      (wouldStartNow &&
-        projection.runs.some((run) => run.status === "queued" && run.heldForRestart === true));
+      holdPhase !== null &&
+      queueBehindRun === undefined &&
+      (dispatchMode.type === "start_immediately" || dispatchMode.type === "queue_after_active") &&
+      ((yield* startKeptForRestart(holdPhase, command)) ||
+        projection.runs.some(
+          (run) =>
+            run.status === "queued" &&
+            run.heldForRestart === true &&
+            !isQueuedIdleCompaction(projection, run),
+        ));
     if (
       queuedForHold &&
       (pendingForkTransferForThread(projection) !== undefined ||
@@ -6071,6 +6103,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         command.createdBy === "agent" &&
         command.creationSource === "provider" &&
         !(yield* stopReachedRun(command, command.threadId, activeRun.id));
+      const ownerHeld =
+        worktreeMissingRun !== undefined ||
+        (queueBehindRun !== undefined &&
+          heldRunsToRelease.length === 0 &&
+          queueIsHeld &&
+          !wakeSkipsHold);
       const run: OrchestrationV2Run = {
         id: runId,
         threadId: command.threadId,
@@ -6082,11 +6120,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         rootNodeId,
         activeAttemptId: attemptId,
         status: "queued",
-        ...(worktreeMissingRun !== undefined ||
-        (heldRunsToRelease.length === 0 && queueIsHeld && !wakeSkipsHold)
-          ? { queueHeld: true }
-          : {}),
-        ...(queuedForRestart ? { heldForRestart: true } : {}),
+        ...(ownerHeld ? { queueHeld: true } : {}),
+        // fork:model-allowlist: the restart's recovery leaves a marked queue to start on its own.
+        ...(holdPhase !== null && !ownerHeld ? { heldForRestart: true } : {}),
         queuePosition:
           goalStopRunId !== undefined
             ? 1
@@ -13453,7 +13489,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       "orchestration_v2.thread_id": commandThreadId(command),
     });
     // fork:model-allowlist: new and replayed alike.
-    if (command.type === "queue.resume" || command.type === "queued-run.start") {
+    if (
+      command.type === "queue.resume" ||
+      command.type === "queued-run.start" ||
+      command.type === "prepared-run.retry"
+    ) {
       yield* refuseWhileHeldForRestart(command);
     }
 
@@ -13656,7 +13696,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         }),
       );
     }
-    // fork:model-allowlist: a message queued behind the runs the restart hold kept starts them.
+    // fork:model-allowlist: a message queued on an idle thread waits behind runs the restart hold
+    // kept; those the drain allows start now, in order.
     if (
       command.type === "message.dispatch" &&
       committed.storedEvents.some(
@@ -13664,17 +13705,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           stored.event.type === "run.created" &&
           stored.event.threadId === command.threadId &&
           stored.event.payload.status === "queued" &&
-          stored.event.payload.heldForRestart !== true,
+          stored.event.payload.heldForRestart === true,
       )
     ) {
-      yield* startNextQueuedRun(command.threadId).pipe(
-        Effect.catchCause((cause) =>
-          Effect.logWarning("Failed to start the runs queued ahead of a message", {
-            threadId: command.threadId,
-            cause,
-          }),
-        ),
-      );
+      yield* mapDispatchError(command)(startNextQueuedRun(command.threadId));
     }
     if (command.type === "notification.delivery.accept") {
       yield* mapDispatchError(command)(offerDelegatedCompletionDeliveries(command.threadId));
