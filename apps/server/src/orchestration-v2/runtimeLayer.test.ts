@@ -16,6 +16,7 @@ import {
   MessageId,
   type OrchestrationV2Command,
   type OrchestrationV2PendingBackgroundTask,
+  type OrchestrationV2ProviderThread,
   NodeId,
   RuntimeRequestId,
   TurnItemId,
@@ -6116,6 +6117,17 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
     });
   const serverWake = { createdBy: "agent", creationSource: "server" } as const;
   const mcpSend = { createdBy: "agent", creationSource: "mcp" } as const;
+  /** As the continuation service sends a wake for a background task that finished. */
+  const providerWake = {
+    createdBy: "agent",
+    creationSource: "provider",
+    notification: {
+      source: { kind: "background_task" },
+      outcome: "updated",
+      summary: "Background activity updated",
+    },
+    dispatchMode: { type: "queue_after_active" },
+  } as const;
 
   it.effect(
     "marks every queued run a drain keeps; recovery leaves them, and a release starts them in order",
@@ -6535,31 +6547,42 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
     }).pipe(releaseHold),
   );
 
-  /** A completed first run whose provider thread still lists `tasks`. */
-  const ended = (threadId: ThreadId, tasks: ReadonlyArray<OrchestrationV2PendingBackgroundTask>) =>
+  /** Updates the thread's provider thread with `fields`, as the adapter's roster events do. */
+  const writeProviderThread = (
+    threadId: ThreadId,
+    tag: string,
+    fields: Partial<OrchestrationV2ProviderThread>,
+  ) =>
     Effect.gen(function* () {
       const orchestrator = yield* Orchestrator.OrchestratorV2;
       const eventSink = yield* EventSink.EventSinkV2;
-      const run = yield* firstRun(threadId, "send");
-      yield* completeRun(threadId, run);
       const providerThread = (yield* orchestrator.getThreadProjection(threadId))
         .providerThreads[0]!;
       const now = yield* DateTime.now;
       yield* eventSink.write({
         events: [
           {
-            id: EventId.make(`${threadId}:roster`),
+            id: EventId.make(`${threadId}:${tag}`),
             type: "provider-thread.updated",
             threadId,
             driver: providerThread.driver,
             providerInstanceId: providerThread.providerInstanceId,
             occurredAt: now,
-            payload: { ...providerThread, pendingBackgroundTasks: tasks, updatedAt: now },
+            payload: { ...providerThread, ...fields, updatedAt: now },
           },
         ],
       });
+    });
+  /** A completed first run whose provider thread still lists `tasks`. */
+  const ended = (threadId: ThreadId, tasks: ReadonlyArray<OrchestrationV2PendingBackgroundTask>) =>
+    Effect.gen(function* () {
+      const run = yield* firstRun(threadId, "send");
+      yield* completeRun(threadId, run);
+      yield* writeProviderThread(threadId, "roster", { pendingBackgroundTasks: tasks });
       return run;
     });
+  const awaitingTests = (threadId: ThreadId) =>
+    ended(threadId, [{ taskId: "tests", kind: "background_task" }]);
 
   it.effect(
     "counts background work the chat still shows as Working after its run ended, not a process T3 no longer waits on",
@@ -6567,9 +6590,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
       Effect.gen(function* () {
         const hold = yield* QueuePromotionHold.QueuePromotionHold;
         const before = yield* hold.busy;
-        yield* ended(ThreadId.make("runtime-layer-busy-awaited-task"), [
-          { taskId: "tests", kind: "background_task" },
-        ]);
+        yield* awaitingTests(ThreadId.make("runtime-layer-busy-awaited-task"));
         assert.equal((yield* hold.busy) - before, 1);
         yield* ended(ThreadId.make("runtime-layer-busy-dev-server"), [
           { taskId: "dev", kind: "command" },
@@ -6597,7 +6618,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         const hold = yield* QueuePromotionHold.QueuePromotionHold;
         const threadId = ThreadId.make("runtime-layer-busy-awaited-behind-kept");
         const before = yield* hold.busy;
-        yield* ended(threadId, [{ taskId: "tests", kind: "background_task" }]);
+        yield* awaitingTests(threadId);
         assert.equal((yield* hold.busy) - before, 1);
         yield* hold.hold;
         yield* orchestrator.dispatch(messageCommand(threadId, "wake", serverWake));
@@ -6605,6 +6626,87 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         assert.isTrue(kept?.heldForRestart);
         assert.equal((yield* hold.busy) - before, 1);
 
+        const started = yield* runUpdated(threadId, kept!.id, (run) => run.status === "starting");
+        yield* Effect.yieldNow;
+        yield* hold.release;
+        yield* Fiber.join(started);
+      }).pipe(releaseHold),
+  );
+
+  /**
+   * The awaited task finishes as Claude reports it with no live turn: the roster empties, then the
+   * continuation service sends the wake. Returns the wake's run and how busy changed with it.
+   */
+  const testsFinish = (threadId: ThreadId) =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const hold = yield* QueuePromotionHold.QueuePromotionHold;
+      const awaited = yield* hold.busy;
+      yield* writeProviderThread(threadId, "roster-cleared", {
+        status: "idle",
+        pendingBackgroundTasks: [],
+      });
+      const cleared = yield* hold.busy;
+      assert.equal(awaited - cleared, 1);
+      yield* orchestrator.dispatch(messageCommand(threadId, "wake", providerWake));
+      const [, wake] = (yield* orchestrator.getThreadProjection(threadId)).runs;
+      return { wake: wake!, busy: (yield* hold.busy) - cleared };
+    });
+
+  it.effect(
+    "a background task finishing under the hold wakes its chat: the drain starts the wake, the cutover keeps it, and either keeps the restart waiting",
+    () =>
+      Effect.gen(function* () {
+        const hold = yield* QueuePromotionHold.QueuePromotionHold;
+        const drainId = ThreadId.make("runtime-layer-wake-in-drain");
+        const cutoverId = ThreadId.make("runtime-layer-wake-in-cutover");
+        yield* awaitingTests(drainId);
+        yield* awaitingTests(cutoverId);
+        const draining = yield* hold.hold;
+        const inDrain = yield* testsFinish(drainId);
+        assert.equal(inDrain.wake.status, "starting");
+        assert.equal(inDrain.busy, 1);
+
+        yield* hold.cutover(draining.generation);
+        const inCutover = yield* testsFinish(cutoverId);
+        assert.equal(inCutover.wake.status, "queued");
+        assert.isTrue(inCutover.wake.heldForRestart);
+        assert.equal(inCutover.busy, 1);
+        // Busy sends the restart back to drain, which starts the wake.
+        const started = yield* runUpdated(
+          cutoverId,
+          inCutover.wake.id,
+          (run) => run.status === "starting",
+        );
+        yield* Effect.yieldNow;
+        yield* hold.drain;
+        yield* Fiber.join(started);
+      }).pipe(releaseHold),
+  );
+
+  it.effect(
+    "a startup that cancels only a buffered wake leaves the run kept behind it to start on its own",
+    () =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const recovery = yield* ProviderRuntimeRecoveryService.ProviderRuntimeRecoveryService;
+        const hold = yield* QueuePromotionHold.QueuePromotionHold;
+        const threadId = ThreadId.make("runtime-layer-wake-ahead-of-kept");
+        yield* awaitingTests(threadId);
+        const draining = yield* hold.hold;
+        yield* hold.cutover(draining.generation);
+        // The wake lands after the restart's last look at busy, and a server message queues behind it.
+        const { wake } = yield* testsFinish(threadId);
+        yield* orchestrator.dispatch(messageCommand(threadId, "follow-up", serverWake));
+        const [, , kept] = (yield* orchestrator.getThreadProjection(threadId)).runs;
+        assert.isTrue(kept?.heldForRestart);
+
+        yield* recovery.reconcile("startup");
+        const { runs } = yield* orchestrator.getThreadProjection(threadId);
+        assert.equal(runs.find((run) => run.id === wake.id)?.status, "cancelled");
+        const recovered = runs.find((run) => run.id === kept!.id);
+        assert.equal(recovered?.status, "queued");
+        assert.notEqual(recovered?.queueHeld, true);
         const started = yield* runUpdated(threadId, kept!.id, (run) => run.status === "starting");
         yield* Effect.yieldNow;
         yield* hold.release;
@@ -6902,12 +7004,11 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
       return wake;
     });
 
-  it.effect("refuses a server message a pending fork cannot queue, leaving no receipt behind", () =>
+  /** A side chat whose fork its first run consumes; a queued run cannot. */
+  const pendingSideChat = (forkId: ThreadId) =>
     Effect.gen(function* () {
       const orchestrator = yield* Orchestrator.OrchestratorV2;
-      const hold = yield* QueuePromotionHold.QueuePromotionHold;
-      const sourceId = ThreadId.make("runtime-layer-held-fork-source");
-      const forkId = ThreadId.make("runtime-layer-held-fork-target");
+      const sourceId = ThreadId.make(`${forkId}:source`);
       yield* createThread(sourceId);
       yield* orchestrator.dispatch({
         type: "thread.fork",
@@ -6919,9 +7020,29 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         createdBy: "user",
         creationSource: "web",
       });
+    });
+
+  it.effect("refuses a server message a pending fork cannot queue, leaving no receipt behind", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const hold = yield* QueuePromotionHold.QueuePromotionHold;
+      const forkId = ThreadId.make("runtime-layer-held-fork-target");
+      yield* pendingSideChat(forkId);
       const wake = yield* wakeRefusedWhileHeld(forkId);
       yield* hold.release;
       yield* orchestrator.dispatch(wake);
+      assert.equal((yield* orchestrator.getThreadProjection(forkId)).runs[0]?.status, "starting");
+    }).pipe(releaseHold),
+  );
+
+  it.effect("while draining, starts a provider wake that a pending fork would refuse if kept", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const hold = yield* QueuePromotionHold.QueuePromotionHold;
+      const forkId = ThreadId.make("runtime-layer-drain-wake-fork");
+      yield* pendingSideChat(forkId);
+      yield* hold.hold;
+      yield* orchestrator.dispatch(messageCommand(forkId, "wake", providerWake));
       assert.equal((yield* orchestrator.getThreadProjection(forkId)).runs[0]?.status, "starting");
     }).pipe(releaseHold),
   );

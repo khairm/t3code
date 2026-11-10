@@ -1,7 +1,7 @@
 // fork:model-allowlist: the idle-gated restart's hold on run starts (gated in the Orchestrator).
-// Drain: T3's own starts wait as queued runs marked heldForRestart; the owner's sends and clicks,
-// and starts caused by a still-active run, go through. Cutover: every start waits. Release, expiry
-// or the restarted server starts what waited. A generation ties a cutover to its hold.
+// Drain: T3's own starts wait as queued runs marked heldForRestart; owner sends and clicks,
+// provider wakes and starts caused by a still-active run go through. Cutover: every start waits.
+// Release, expiry or the restarted server starts what waited; a generation ties cutover to hold.
 import type { OrchestrationV2Run, ThreadId } from "@t3tools/contracts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as Clock from "effect/Clock";
@@ -25,6 +25,7 @@ import { latestExecutedRun } from "@t3tools/shared/orchestrationV2ThreadError";
 import { isActiveRun } from "./CommandPolicy.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
 import * as EventSink from "./EventSink.ts";
+import { isBufferedProviderNotification } from "./NotificationMailbox.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import { isCutBackgroundItem } from "./ProviderRuntimeRecoveryService.ts";
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
@@ -78,8 +79,9 @@ export interface QueuePromotionHoldShape {
   /** Null when not held. Read under the thread's dispatch lock, so the hold can wait out a decision. */
   readonly phase: Effect.Effect<QueuePromotionHoldPhase | null>;
   /**
-   * How many threads a T3 stop would cut: one with a live run, awaited background work or a
-   * background step still running, or an accepted response the provider has not received.
+   * How many threads a T3 stop would cut: one with a live run, a provider wake waiting to start,
+   * awaited background work or a background step still running, or an accepted response the
+   * provider has not received.
    */
   readonly busy: Effect.Effect<number>;
   /** Sets a drain hold, or refreshes the current hold's expiry in its phase; replies once every earlier start decision has committed. */
@@ -338,12 +340,19 @@ const make = Effect.gen(function* () {
     const { runs } = yield* projections.getThreadRecords(threadId, ["runs"]);
     // A waiting run's agent turn is over; what it still waits on is read below, as after any run.
     if (runs.some((run) => isActiveRun(run) && run.status !== "waiting")) return true;
-    const { thread, providerThreads, turnItems } = yield* projections.getThreadRecords(
+    const { thread, providerThreads, turnItems, messages } = yield* projections.getThreadRecords(
       threadId,
-      ["providerThreads", "turnItems"],
-      { turnItemTypes: BACKGROUND_TURN_ITEM_TYPES, turnItemStatuses: ACTIVE_TURN_ITEM_STATUSES },
+      ["providerThreads", "turnItems", "messages"],
+      {
+        turnItemTypes: BACKGROUND_TURN_ITEM_TYPES,
+        turnItemStatuses: ACTIVE_TURN_ITEM_STATUSES,
+        messageIds: runs
+          .filter((run) => run.status === "queued" && run.queueHeld !== true)
+          .map((run) => run.userMessageId),
+      },
     );
     return (
+      messages.some(isBufferedProviderNotification) ||
       turnItems.some(isCutBackgroundItem) ||
       backgroundWorkHoldsCompletion(
         derivePendingBackgroundWork({

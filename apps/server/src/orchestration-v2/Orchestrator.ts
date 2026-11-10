@@ -792,7 +792,12 @@ function isQueuedIdleCompaction(
 
 type HeldMessage = Pick<
   OrchestrationV2ConversationMessage,
-  "createdBy" | "creationSource" | "scheduledTaskId" | "senderThreadId"
+  | "createdBy"
+  | "creationSource"
+  | "scheduledTaskId"
+  | "senderThreadId"
+  | "notification"
+  | "delegatedCompletion"
 >;
 /**
  * fork:model-allowlist: a send the owner made, which a draining restart hold lets start: from a
@@ -805,6 +810,20 @@ function isOwnerSend(message: HeldMessage): boolean {
     ((message.createdBy === "user" &&
       (message.creationSource === "web" || message.creationSource === "mobile")) ||
       (message.creationSource === "mcp" && message.senderThreadId === undefined))
+  );
+}
+
+/**
+ * fork:model-allowlist: a start a draining restart hold always lets through: the owner's send, or
+ * a wake whose buffered output a restart would cancel (`isBufferedProviderNotification`).
+ */
+function startsWhileDraining(message: HeldMessage): boolean {
+  return (
+    isOwnerSend(message) ||
+    (message.createdBy === "agent" &&
+      message.creationSource === "provider" &&
+      message.notification !== undefined &&
+      message.delegatedCompletion === undefined)
   );
 }
 
@@ -1598,11 +1617,6 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       return yield* heldForRestartError(command);
     },
   );
-  /**
-   * Whether `phase` keeps a start for `message`. The cutover keeps every start. Draining lets the
-   * owner's send through, and a start caused by a run that is still active (a delegate child, an
-   * agent's send), as that run already keeps the restart waiting.
-   */
   const senderStillActive = Effect.fn("Orchestrator.senderStillActive")(function* (
     senderThreadId: ThreadId,
   ) {
@@ -1615,12 +1629,17 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       );
     return sender.runs.some(isActiveRun);
   });
+  /**
+   * Whether `phase` keeps a start for `message`. The cutover keeps every start. Draining lets the
+   * owner's send and a provider wake through, and a start caused by a run that is still active (a
+   * delegate child, an agent's send), as that run already keeps the restart waiting.
+   */
   const startKeptForRestart = Effect.fn("Orchestrator.startKeptForRestart")(function* (
     phase: QueuePromotionHold.QueuePromotionHoldPhase,
     message: HeldMessage,
   ) {
     if (phase === "cutover") return true;
-    if (isOwnerSend(message)) return false;
+    if (startsWhileDraining(message)) return false;
     return (
       message.senderThreadId === undefined || !(yield* senderStillActive(message.senderThreadId))
     );
@@ -1643,7 +1662,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     const queuedMessages = projection.messages.filter((message) =>
       queuedMessageIds.has(message.id),
     );
-    if (queuedMessages.some(isOwnerSend)) return false;
+    if (queuedMessages.some(startsWhileDraining)) return false;
     const senders = new Set(
       queuedMessages.flatMap((message) =>
         message.senderThreadId === undefined ? [] : [message.senderThreadId],
