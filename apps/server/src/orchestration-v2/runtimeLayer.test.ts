@@ -15,6 +15,7 @@ import {
   IDLE_COMPACTION_TEXT,
   MessageId,
   type OrchestrationV2Command,
+  type OrchestrationV2PendingBackgroundTask,
   NodeId,
   RuntimeRequestId,
   TurnItemId,
@@ -6314,48 +6315,63 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
       }).pipe(releaseHold),
   );
 
+  const serverLaunch = {
+    ...serverWake,
+    dispatchMode: { type: "defer_start" as const, workspaceStrategy: { type: "root" as const } },
+  };
+  const releasePrepared = (threadId: ThreadId, runId: RunId) =>
+    Effect.flatMap(Orchestrator.OrchestratorV2, (orchestrator) =>
+      orchestrator.dispatch({
+        type: "prepared-run.release",
+        commandId: CommandId.make(`${threadId}:release`),
+        threadId,
+        runId,
+      }),
+    );
+
+  it.effect("holds a prepared launch at its release, and starts it once released", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+      const hold = yield* QueuePromotionHold.QueuePromotionHold;
+      const threadId = ThreadId.make("runtime-layer-held-prepared-launch");
+      yield* hold.hold;
+      const preparing = yield* firstRun(threadId, "launch", serverLaunch);
+      assert.equal(preparing.status, "preparing");
+      yield* releasePrepared(threadId, preparing.id);
+      yield* worker.drain();
+      const [queued] = (yield* orchestrator.getThreadProjection(threadId)).runs;
+      assert.equal(queued?.status, "queued");
+      assert.isTrue(queued?.heldForRestart);
+
+      const started = yield* runUpdated(threadId, preparing.id, (run) => run.status === "starting");
+      yield* Effect.yieldNow;
+      yield* hold.release;
+      yield* Fiber.join(started);
+    }).pipe(releaseHold),
+  );
+
   it.effect(
-    "holds a prepared launch at its release ahead of the messages queued behind it, and starts it once released",
+    "while draining, a prepared launch starts at its release when the owner's message waits behind it",
     () =>
       Effect.gen(function* () {
         const orchestrator = yield* Orchestrator.OrchestratorV2;
-        const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
         const hold = yield* QueuePromotionHold.QueuePromotionHold;
-        const threadId = ThreadId.make("runtime-layer-held-prepared-launch");
+        const threadId = ThreadId.make("runtime-layer-released-ahead-of-owner");
         yield* hold.hold;
-        const preparing = yield* firstRun(threadId, "launch", {
-          creationSource: "server",
-          dispatchMode: { type: "defer_start", workspaceStrategy: { type: "root" } },
-        });
-        assert.equal(preparing.status, "preparing");
+        const preparing = yield* firstRun(threadId, "launch", serverLaunch);
         yield* orchestrator.dispatch(
           messageCommand(threadId, "follow-up", { dispatchMode: { type: "queue_after_active" } }),
         );
-        yield* orchestrator.dispatch({
-          type: "prepared-run.release",
-          commandId: CommandId.make(`${threadId}:release`),
-          threadId,
-          runId: preparing.id,
-        });
-        yield* worker.drain();
+        yield* releasePrepared(threadId, preparing.id);
         const released = yield* orchestrator.getThreadProjection(threadId);
-        const [queued, followUp] = released.runs;
-        assert.equal(queued?.status, "queued");
-        assert.isTrue(queued?.heldForRestart);
+        const [launch, followUp] = released.runs;
+        assert.equal(launch?.status, "starting");
+        assert.equal(followUp?.status, "queued");
         assert.deepEqual(
           queuedRunsInDeliveryOrder(released).map((run) => run.id),
-          [preparing.id, followUp!.id],
+          [followUp!.id],
         );
-
-        const started = yield* runUpdated(
-          threadId,
-          preparing.id,
-          (run) => run.status === "starting",
-        );
-        yield* Effect.yieldNow;
-        yield* hold.release;
-        yield* Fiber.join(started);
-        assert.equal((yield* orchestrator.getThreadProjection(threadId)).runs[1]?.status, "queued");
       }).pipe(releaseHold),
   );
 
@@ -6507,10 +6523,275 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
       const shell = yield* orchestrator.getShellSnapshot();
       assert.isNull(shell.threads.find((thread) => thread.id === compactingId)?.activeRunId);
       yield* hold.hold;
-      const kept = yield* firstRun(ThreadId.make("runtime-layer-busy-kept"), "wake", serverWake);
+      const keptId = ThreadId.make("runtime-layer-busy-kept");
+      const kept = yield* firstRun(keptId, "wake", serverWake);
       assert.equal(kept.status, "queued");
       assert.equal((yield* hold.busy) - before, 4);
+      const started = yield* runUpdated(keptId, kept.id, (run) => run.status === "starting");
+      yield* Effect.yieldNow;
+      yield* hold.release;
+      yield* Fiber.join(started);
     }).pipe(releaseHold),
+  );
+
+  it.effect(
+    "counts background work the chat still shows as Working after its run ended, not a process T3 no longer waits on",
+    () =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const eventSink = yield* EventSink.EventSinkV2;
+        const hold = yield* QueuePromotionHold.QueuePromotionHold;
+        const before = yield* hold.busy;
+        /** A completed first run whose provider thread still lists `tasks`. */
+        const ended = (
+          threadId: ThreadId,
+          tasks: ReadonlyArray<OrchestrationV2PendingBackgroundTask>,
+        ) =>
+          Effect.gen(function* () {
+            const run = yield* firstRun(threadId, "send");
+            yield* completeRun(threadId, run);
+            const providerThread = (yield* orchestrator.getThreadProjection(threadId))
+              .providerThreads[0]!;
+            const now = yield* DateTime.now;
+            yield* eventSink.write({
+              events: [
+                {
+                  id: EventId.make(`${threadId}:roster`),
+                  type: "provider-thread.updated",
+                  threadId,
+                  driver: providerThread.driver,
+                  providerInstanceId: providerThread.providerInstanceId,
+                  occurredAt: now,
+                  payload: { ...providerThread, pendingBackgroundTasks: tasks, updatedAt: now },
+                },
+              ],
+            });
+            return run;
+          });
+        yield* ended(ThreadId.make("runtime-layer-busy-awaited-task"), [
+          { taskId: "tests", kind: "background_task" },
+        ]);
+        assert.equal((yield* hold.busy) - before, 1);
+        yield* ended(ThreadId.make("runtime-layer-busy-dev-server"), [
+          { taskId: "dev", kind: "command" },
+        ]);
+        assert.equal((yield* hold.busy) - before, 1);
+        const itemThreadId = ThreadId.make("runtime-layer-busy-running-item");
+        yield* writeTurnItem(itemThreadId, yield* ended(itemThreadId, []), "command", (now) => ({
+          type: "command_execution",
+          status: "running",
+          title: "sleep 60",
+          startedAt: now,
+          completedAt: null,
+          updatedAt: now,
+          input: "sleep 60",
+        }));
+        assert.equal((yield* hold.busy) - before, 2);
+      }),
+  );
+
+  /** A pending question on `threadId` asked by `runId`, answered live into `providerSessionId` or as a message. */
+  const seedQuestion = (
+    threadId: ThreadId,
+    runId: RunId | null,
+    providerSessionId: ProviderSessionId | null,
+  ) =>
+    Effect.gen(function* () {
+      const eventSink = yield* EventSink.EventSinkV2;
+      const now = yield* DateTime.now;
+      const requestId = RuntimeRequestId.make(`${threadId}:question`);
+      const nodeId = NodeId.make(`${threadId}:question-node`);
+      if (providerSessionId !== null) {
+        // Projected as attached with no live session behind it, so a delivery fails and waits to retry.
+        yield* eventSink.write({
+          events: [
+            {
+              id: EventId.make(`${threadId}:question-session`),
+              type: "provider-session.attached",
+              threadId,
+              driver,
+              occurredAt: now,
+              payload: {
+                id: providerSessionId,
+                driver,
+                providerInstanceId: modelSelection.instanceId,
+                status: "running",
+                cwd: process.cwd(),
+                model: modelSelection.model,
+                capabilities: CodexProviderCapabilitiesV2,
+                createdAt: now,
+                updatedAt: now,
+                lastError: null,
+              },
+            },
+          ],
+        });
+      }
+      const base = { threadId, nodeId, occurredAt: now, ...(runId === null ? {} : { runId }) };
+      yield* eventSink.write({
+        events: [
+          {
+            ...base,
+            id: EventId.make(`${threadId}:question-node-event`),
+            type: "node.updated",
+            payload: {
+              id: nodeId,
+              threadId,
+              runId,
+              parentNodeId: null,
+              rootNodeId: nodeId,
+              kind: "user_input_request",
+              status: "waiting",
+              countsForRun: false,
+              providerThreadId: null,
+              providerTurnId: null,
+              nativeItemRef: null,
+              runtimeRequestId: requestId,
+              checkpointScopeId: null,
+              startedAt: now,
+              completedAt: null,
+            },
+          },
+          {
+            ...base,
+            id: EventId.make(`${threadId}:question-request`),
+            type: "runtime-request.updated",
+            payload: {
+              id: requestId,
+              nodeId,
+              providerTurnId: null,
+              nativeRequestRef: null,
+              kind: "user_input",
+              status: "pending",
+              responseCapability:
+                providerSessionId === null
+                  ? { type: "message" }
+                  : { type: "live", providerSessionId },
+              createdAt: now,
+              resolvedAt: null,
+            },
+          },
+          {
+            ...base,
+            id: EventId.make(`${threadId}:question-item`),
+            type: "turn-item.updated",
+            payload: {
+              id: TurnItemId.make(`${threadId}:question-item`),
+              type: "user_input_request",
+              threadId,
+              runId,
+              nodeId,
+              providerThreadId: null,
+              providerTurnId: null,
+              nativeItemRef: null,
+              parentItemId: null,
+              ordinal: 0,
+              status: "waiting",
+              title: null,
+              startedAt: now,
+              completedAt: null,
+              updatedAt: now,
+              requestId,
+              questions: [{ id: "color", header: "Color", question: "Which color?", options: [] }],
+            },
+          },
+        ],
+      });
+      return requestId;
+    });
+  const answerCommand = (threadId: ThreadId, requestId: RuntimeRequestId) => ({
+    type: "runtime-request.respond" as const,
+    commandId: CommandId.make(`${threadId}:answer`),
+    threadId,
+    requestId,
+    answers: { color: "Blue" },
+  });
+
+  it.effect(
+    "while draining, the owner's answer to a question starts now, and one queued behind a run starts when that run ends",
+    () =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const hold = yield* QueuePromotionHold.QueuePromotionHold;
+        const idleId = ThreadId.make("runtime-layer-drain-answer-idle");
+        yield* createThread(idleId);
+        const idleQuestion = yield* seedQuestion(idleId, null, null);
+        const busyId = ThreadId.make("runtime-layer-drain-answer-behind-active");
+        const active = yield* firstRun(busyId, "active");
+        const busyQuestion = yield* seedQuestion(busyId, active.id, null);
+        yield* hold.hold;
+        yield* orchestrator.dispatch(answerCommand(idleId, idleQuestion));
+        assert.equal((yield* orchestrator.getThreadProjection(idleId)).runs[0]?.status, "starting");
+
+        yield* orchestrator.dispatch(answerCommand(busyId, busyQuestion));
+        const [, queued] = (yield* orchestrator.getThreadProjection(busyId)).runs;
+        assert.equal(queued?.status, "queued");
+        const started = yield* runUpdated(busyId, queued!.id, (run) => run.status === "starting");
+        yield* Effect.yieldNow;
+        yield* completeRun(busyId, active);
+        yield* Fiber.join(started);
+      }).pipe(releaseHold),
+  );
+
+  it.effect(
+    "the cutover refuses a live answer, which the drain accepts and counts busy until its delivery is tried",
+    () =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+        const outbox = yield* EffectOutbox.EffectOutboxV2;
+        const hold = yield* QueuePromotionHold.QueuePromotionHold;
+        const threadId = ThreadId.make("runtime-layer-cutover-live-answer");
+        yield* createThread(threadId);
+        const requestId = yield* seedQuestion(
+          threadId,
+          null,
+          ProviderSessionId.make(`${threadId}:session`),
+        );
+        const answer = answerCommand(threadId, requestId);
+        const draining = yield* hold.hold;
+        const before = yield* hold.busy;
+        yield* hold.cutover(draining.generation);
+        const refused = yield* orchestrator.dispatch(answer).pipe(Effect.flip);
+        assert.equal(
+          userFacingDispatchErrorMessage(refused),
+          QueuePromotionHold.QUEUE_PROMOTION_HELD_MESSAGE,
+        );
+        assert.equal(
+          (yield* orchestrator.getThreadProjection(threadId)).runtimeRequests[0]?.status,
+          "pending",
+        );
+
+        yield* hold.drain;
+        yield* orchestrator.dispatch(answer);
+        assert.equal((yield* hold.busy) - before, 1);
+        assert.include(yield* outbox.threadIdsDelivering("runtime-request.respond"), threadId);
+        yield* worker.drain();
+        assert.notInclude(yield* outbox.threadIdsDelivering("runtime-request.respond"), threadId);
+      }).pipe(releaseHold),
+  );
+
+  it.effect(
+    "while draining, starts an MCP send with no sending thread and holds a scheduled task's",
+    () =>
+      Effect.gen(function* () {
+        const hold = yield* QueuePromotionHold.QueuePromotionHold;
+        yield* hold.hold;
+        const mcpSend = { createdBy: "agent" as const, creationSource: "mcp" as const };
+        const voice = yield* firstRun(
+          ThreadId.make("runtime-layer-drain-mcp-no-sender"),
+          "voice",
+          mcpSend,
+        );
+        assert.equal(voice.status, "starting");
+        const scheduled = yield* firstRun(
+          ThreadId.make("runtime-layer-drain-mcp-scheduled"),
+          "scheduled",
+          { ...mcpSend, scheduledTaskId: ScheduledTaskId.make("runtime-layer-drain-task") },
+        );
+        assert.equal(scheduled.status, "queued");
+        assert.isTrue(scheduled.heldForRestart);
+      }).pipe(releaseHold),
   );
 
   it.effect(

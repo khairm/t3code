@@ -207,6 +207,10 @@ export interface EffectOutboxV2Shape {
   readonly listByCommandId: (
     commandId: CommandId,
   ) => Effect.Effect<ReadonlyArray<OrchestrationEffectV2>, EffectOutboxError>;
+  /** fork:model-allowlist: threads with an `effectType` effect running, or pending and due. */
+  readonly threadIdsDelivering: (
+    effectType: OrchestrationEffectRequestV2["type"],
+  ) => Effect.Effect<ReadonlyArray<ThreadId>, EffectOutboxError>;
   readonly cancelUnsettled: (input: {
     readonly threadId: ThreadId;
     readonly effectTypes: ReadonlyArray<OrchestrationEffectRequestV2["type"]>;
@@ -436,6 +440,18 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
               : new EffectOutboxError({ operation: "list", cause }),
           ),
         ),
+      threadIdsDelivering: Effect.fn("EffectOutbox.threadIdsDelivering")(
+        function* (effectType) {
+          const now = DateTime.formatIso(yield* DateTime.now);
+          const rows = yield* sql<{ readonly thread_id: string }>`
+            SELECT DISTINCT thread_id FROM orchestration_v2_effect_outbox
+            WHERE effect_type = ${effectType}
+              AND (status = 'running' OR (status = 'pending' AND available_at <= ${now}))
+          `.pipe(NodeSqliteClient.readOnly);
+          return rows.map((row) => ThreadId.make(row.thread_id));
+        },
+        Effect.mapError((cause) => new EffectOutboxError({ operation: "list-delivering", cause })),
+      ),
       cancelUnsettled: Effect.fn("EffectOutbox.cancelUnsettled")(
         function* ({ threadId, effectTypes, reason }) {
           if (effectTypes.length === 0) return [];

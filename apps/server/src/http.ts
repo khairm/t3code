@@ -406,7 +406,7 @@ const decodeQueuePromotionHoldRequest = Schema.decodeEffect(
 const queuePromotionErrorJson = (status: number, error: string, message: string) =>
   HttpServerResponse.jsonUnsafe({ error, message }, { status });
 
-/** Every status body carries `busy`: the runs a T3 stop would cut, which the restart waits to see at 0. */
+/** Every status body carries `busy` (see `QueuePromotionHoldShape.busy`), which the restart waits to see at 0. */
 const queuePromotionRoute = (
   method: "GET" | "POST",
   path: HttpRouter.PathInput,

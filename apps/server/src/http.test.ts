@@ -37,6 +37,7 @@ import {
 
 import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
 import * as ServerConfig from "./config.ts";
+import * as EffectOutbox from "./orchestration-v2/EffectOutbox.ts";
 import * as EventSink from "./orchestration-v2/EventSink.ts";
 import * as ProjectionStore from "./orchestration-v2/ProjectionStore.ts";
 import * as QueuePromotionHold from "./orchestration-v2/QueuePromotionHold.ts";
@@ -911,6 +912,11 @@ describe("queue promotion hold routes", () => {
           }),
         ),
         Layer.provide(Layer.mock(EventSink.EventSinkV2)({})),
+        Layer.provide(
+          Layer.mock(EffectOutbox.EffectOutboxV2)({
+            threadIdsDelivering: () => Effect.succeed([]),
+          }),
+        ),
         Layer.provide(IdAllocator.layer),
         Layer.provideMerge(NodeHttpServer.layerTest),
       ),

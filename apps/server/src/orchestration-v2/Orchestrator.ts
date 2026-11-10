@@ -803,6 +803,24 @@ function isClientSend(
   );
 }
 
+type HeldMessage = Pick<
+  OrchestrationV2ConversationMessage,
+  "createdBy" | "creationSource" | "scheduledTaskId" | "senderThreadId"
+>;
+/**
+ * fork:model-allowlist: a send the owner made, which a draining restart hold lets start: from a
+ * client, or through MCP with no sending thread (the voice bridge, a phone). A scheduled task and
+ * a thread's send to another are T3's own work.
+ */
+function isOwnerSend(message: HeldMessage): boolean {
+  return (
+    isClientSend(message) ||
+    (message.creationSource === "mcp" &&
+      message.senderThreadId === undefined &&
+      message.scheduledTaskId === undefined)
+  );
+}
+
 function followsCurrentConversation(
   message: OrchestrationV2ConversationMessage | undefined,
 ): boolean {
@@ -1593,13 +1611,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       return yield* heldForRestartError(command);
     },
   );
-  type HeldMessage = Pick<
-    OrchestrationV2ConversationMessage,
-    "createdBy" | "creationSource" | "scheduledTaskId" | "senderThreadId"
-  >;
   /**
-   * Whether `phase` keeps a start for `message`. The cutover keeps every start. Draining lets a
-   * client send through, and a start caused by a run that is still active (a delegate child, an
+   * Whether `phase` keeps a start for `message`. The cutover keeps every start. Draining lets the
+   * owner's send through, and a start caused by a run that is still active (a delegate child, an
    * agent's send), as that run already keeps the restart waiting.
    */
   const senderStillActive = Effect.fn("Orchestrator.senderStillActive")(function* (
@@ -1619,7 +1633,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     message: HeldMessage,
   ) {
     if (phase === "cutover") return true;
-    if (isClientSend(message)) return false;
+    if (isOwnerSend(message)) return false;
     return (
       message.senderThreadId === undefined || !(yield* senderStillActive(message.senderThreadId))
     );
@@ -1642,7 +1656,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     const queuedMessages = projection.messages.filter((message) =>
       queuedMessageIds.has(message.id),
     );
-    if (queuedMessages.some(isClientSend)) return false;
+    if (queuedMessages.some(isOwnerSend)) return false;
     const senders = new Set(
       queuedMessages.flatMap((message) =>
         message.senderThreadId === undefined ? [] : [message.senderThreadId],
@@ -9077,6 +9091,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           cause: `Provider session ${providerSessionId} was not found.`,
         });
       }
+      // fork:model-allowlist: a live response resumes the provider's turn, which the cutover holds.
+      if (providerSessionId !== null) yield* refuseWhileHeldForRestart(command);
       let answers = command.answers;
       if (runtimeRequest.kind === "user_input" && answers !== undefined) {
         const decoded = yield* decodeUserInputAnswers(answers).pipe(mapDispatchError(command));
@@ -9346,7 +9362,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           text: replies.join("\n\n"),
           attachments: [],
           createdBy: "user" as const,
-          creationSource: "server" as const,
+          // fork:model-allowlist: the command carries no provenance; an answer is the owner's (a
+          // client, or an MCP caller whose own run is active), so it starts as their sends do.
+          creationSource: "web" as const,
           dispatchMode,
         };
         yield* dispatchMessage(answer, events, effects);
@@ -13696,19 +13714,18 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         }),
       );
     }
-    // fork:model-allowlist: a message queued on an idle thread waits behind runs the restart hold
-    // kept; those the drain allows start now, in order.
+    // fork:model-allowlist: a command that left a run queued for the restart hold on its thread
+    // may have the owner's message behind it; what the drain allows starts now, in order.
     if (
-      command.type === "message.dispatch" &&
       committed.storedEvents.some(
         (stored) =>
-          stored.event.type === "run.created" &&
-          stored.event.threadId === command.threadId &&
+          (stored.event.type === "run.created" || stored.event.type === "run.updated") &&
+          stored.event.threadId === commandThreadId(command) &&
           stored.event.payload.status === "queued" &&
           stored.event.payload.heldForRestart === true,
       )
     ) {
-      yield* mapDispatchError(command)(startNextQueuedRun(command.threadId));
+      yield* mapDispatchError(command)(startNextQueuedRun(commandThreadId(command)));
     }
     if (command.type === "notification.delivery.accept") {
       yield* mapDispatchError(command)(offerDelegatedCompletionDeliveries(command.threadId));

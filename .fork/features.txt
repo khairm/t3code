@@ -48,3 +48,4 @@ fork:model-allowlist apps/server/src/serverRuntimeStartup.ts
 fork:model-allowlist apps/server/src/orchestration-v2/UsageLimitRecoveryWorker.test.ts
 fork:model-allowlist apps/server/src/mcp/TaskCancelUsageLimit.integration.test.ts
 fork:model-allowlist apps/server/src/serverRuntimeStartup.test.ts
+fork:model-allowlist apps/server/src/orchestration-v2/EffectOutbox.ts

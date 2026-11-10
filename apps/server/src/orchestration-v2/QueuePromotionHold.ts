@@ -16,7 +16,14 @@ import * as PubSub from "effect/PubSub";
 import * as Stream from "effect/Stream";
 import * as SynchronizedRef from "effect/SynchronizedRef";
 
+import {
+  backgroundWorkHoldsCompletion,
+  derivePendingBackgroundWork,
+} from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
+import { latestUnheldRun } from "@t3tools/shared/orchestrationV2ThreadError";
+
 import { isActiveRun } from "./CommandPolicy.ts";
+import * as EffectOutbox from "./EffectOutbox.ts";
 import * as EventSink from "./EventSink.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import { isCutBackgroundItem } from "./ProviderRuntimeRecoveryService.ts";
@@ -70,7 +77,10 @@ export interface QueuePromotionHoldShape {
   readonly status: Effect.Effect<QueuePromotionHoldStatus>;
   /** Null when not held. Read under the thread's dispatch lock, so the hold can wait out a decision. */
   readonly phase: Effect.Effect<QueuePromotionHoldPhase | null>;
-  /** How many runs a T3 stop would cut: preparing, starting, running, or waiting on background work. */
+  /**
+   * How many threads a T3 stop would cut: one with a live run, background work that keeps the chat
+   * "Working" or still runs in a turn, or an accepted response the provider has not received.
+   */
   readonly busy: Effect.Effect<number>;
   /** Sets a drain hold, or refreshes the current hold's expiry in its phase; replies once every earlier start decision has committed. */
   readonly hold: Effect.Effect<QueuePromotionHoldStatus, QueuePromotionHoldLockWaitError>;
@@ -121,10 +131,12 @@ const expired = (status: Held, now: DateTime.Utc) =>
   DateTime.isGreaterThanOrEqualTo(now, status.expiresAt);
 
 const BACKGROUND_TURN_ITEM_TYPES = ["command_execution", "dynamic_tool", "subagent"] as const;
+const ACTIVE_TURN_ITEM_STATUSES = ["pending", "running", "waiting"] as const;
 
 const make = Effect.gen(function* () {
   const threadLocks = yield* ThreadCommandExecutor.ThreadCommandExecutor;
   const projections = yield* ProjectionStore.ProjectionStoreV2;
+  const outbox = yield* EffectOutbox.EffectOutboxV2;
   const eventSink = yield* EventSink.EventSinkV2;
   const ids = yield* IdAllocator.IdAllocatorV2;
   const scope = yield* Effect.scope;
@@ -311,29 +323,36 @@ const make = Effect.gen(function* () {
     return current;
   });
 
-  /** Active runs, less those waiting on the user with no background work a stop would cut. */
-  const busyIn = Effect.fnUntraced(function* (threadId: ThreadId) {
-    const active = (yield* projections.getThreadRecords(threadId, ["runs"])).runs.filter(
-      isActiveRun,
+  const busyIn = Effect.fnUntraced(function* (threadId: ThreadId, delivering: boolean) {
+    const { runs } = yield* projections.getThreadRecords(threadId, ["runs"]);
+    // A waiting run's agent turn is over; what it still waits on is read below, as after any run.
+    if (delivering || runs.some((run) => isActiveRun(run) && run.status !== "waiting")) return true;
+    const { thread, providerThreads, turnItems } = yield* projections.getThreadRecords(
+      threadId,
+      ["providerThreads", "turnItems"],
+      { turnItemTypes: BACKGROUND_TURN_ITEM_TYPES, turnItemStatuses: ACTIVE_TURN_ITEM_STATUSES },
     );
-    const waiting = active.filter((run) => run.status === "waiting");
-    if (waiting.length === 0) return active.length;
-    const { turnItems } = yield* projections.getThreadRecords(threadId, ["turnItems"], {
-      turnItemTypes: BACKGROUND_TURN_ITEM_TYPES,
-      turnItemRunIds: waiting.map((run) => run.id),
-    });
-    const idle = waiting.filter(
-      (run) => !turnItems.some((item) => item.runId === run.id && isCutBackgroundItem(item)),
+    return (
+      turnItems.some(isCutBackgroundItem) ||
+      backgroundWorkHoldsCompletion(
+        derivePendingBackgroundWork({
+          latestRun: latestUnheldRun(runs),
+          providerThreads,
+          turnItems,
+          activeProviderThreadId: thread.activeProviderThreadId,
+          runs,
+        }),
+      )
     );
-    return active.length - idle.length;
   });
-  const busy = Effect.flatMap(
-    projections.getRecoveryThreadIds("runtime"),
-    Effect.forEach(busyIn),
-  ).pipe(
-    Effect.map((counts) => counts.reduce((total, count) => total + count, 0)),
-    Effect.orDie,
-  );
+  const busy = Effect.gen(function* () {
+    const delivering = new Set(yield* outbox.threadIdsDelivering("runtime-request.respond"));
+    const threads = yield* Effect.forEach(
+      yield* projections.getRecoveryThreadIds("runtime"),
+      (threadId) => busyIn(threadId, delivering.has(threadId)),
+    );
+    return threads.filter(Boolean).length;
+  }).pipe(Effect.orDie);
 
   return QueuePromotionHold.of({
     status,
