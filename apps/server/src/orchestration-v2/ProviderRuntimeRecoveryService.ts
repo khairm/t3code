@@ -121,6 +121,17 @@ function isAppOwnedDelegationItem(
   return item.type === "subagent" && isAppOwnedDelegation(item);
 }
 
+/** Background work a server stop cuts short, which recovery cancels at the next startup. */
+export function isCutBackgroundItem(
+  item: OrchestrationV2ThreadProjection["turnItems"][number],
+): boolean {
+  return (
+    isBackgroundCapableTurnItemType(item.type) &&
+    isNonterminalTurnItemStatus(item.status) &&
+    !isAppOwnedDelegationItem(item)
+  );
+}
+
 function providerThreadHasPendingBackgroundTasks(
   providerThread: OrchestrationV2ThreadProjection["providerThreads"][number],
 ): boolean {
@@ -426,7 +437,16 @@ export const make = Effect.gen(function* () {
           runs.push(run);
           continue;
         }
-        if (run.queueHeld === true && retryableRuns.length === 0) continue;
+        // fork:model-allowlist: a queue the restart hold kept starts on its own after startup, unless
+        // this pass cuts a run (more than a buffered queued one), which holds the queue for the owner.
+        // A retryable run was cut too, and re-holds every run with its queue position.
+        if (
+          retryableRuns.length === 0 &&
+          (run.queueHeld === true ||
+            (queuedRuns.some((kept) => kept.heldForRestart === true) &&
+              runs.every((cut) => cut.status === "queued")))
+        )
+          continue;
         events.push({
           id: yield* allocateEventId(),
           type: "run.updated",
@@ -664,10 +684,7 @@ export const make = Effect.gen(function* () {
         if (item.runId !== null && recoveredNonterminalRunIds.has(item.runId)) {
           continue;
         }
-        if (!isBackgroundCapableTurnItemType(item.type)) {
-          continue;
-        }
-        if (!isNonterminalTurnItemStatus(item.status) || isAppOwnedDelegationItem(item)) {
+        if (!isCutBackgroundItem(item)) {
           continue;
         }
         const providerInstanceId = resolveStaleBackgroundItemProviderInstanceId(item, projection);

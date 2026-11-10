@@ -13,6 +13,7 @@ import { ChildProcessSpawner } from "effect/process";
 import { makeCodexTextGeneration } from "../../textGeneration/CodexTextGeneration.ts";
 import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
 import { chatGptModels } from "../CodexChatGptModels.ts";
+import { filterAllowedModels } from "../allowedModels.ts";
 import { makeCodexManagedRuntime } from "../CodexManagedRuntime.ts";
 import { ProviderDriverError } from "../Errors.ts";
 import { createCodexAdapterV2 } from "../../orchestration-v2/Adapters/CodexAdapterV2.ts";
@@ -148,7 +149,11 @@ export const makeManagedCodexProvider = Effect.fn("makeManagedCodexProvider")(fu
           const models = yield* chatGptModels(credentials.accessToken, draft.models).pipe(
             Effect.provideService(HttpClient.HttpClient, http),
           );
-          return { ...draft, models };
+          // fork:model-allowlist
+          return {
+            ...draft,
+            models: filterAllowedModels(models, DRIVER),
+          };
         }),
       ),
       Effect.map((draft) =>

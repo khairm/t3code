@@ -51,6 +51,7 @@ import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import * as ProviderTurnStart from "./ProviderTurnStartService.ts";
+import { withProductionAllowlist } from "../provider/allowedModels.testkit.ts";
 import * as RunExecutionService from "./RunExecutionService.ts";
 import * as ProviderUsageAnalytics from "../telemetry/ProviderUsageAnalytics.ts";
 import * as RuntimePolicy from "./RuntimePolicy.ts";
@@ -112,6 +113,7 @@ function startWithMissingWorktree(
         providerThreadId,
         userMessageId: messageId,
         ordinal: 2,
+        modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" },
       },
     ],
     nodes: [{ id: rootNodeId, checkpointScopeId }],
@@ -1236,6 +1238,40 @@ effectIt.effect(
       ]);
       expect(JSON.stringify(harness.events)).not.toContain("private git diagnostic");
     }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+);
+
+// fork:model-allowlist
+effectIt.effect("refuses a blocked model before opening its session, without a pilot hop", () =>
+  Effect.gen(function* () {
+    const harness = makeLocalCommandHarness({ text: "Continue" });
+
+    yield* harness.start;
+
+    expect(harness.open).not.toHaveBeenCalled();
+    expect(harness.projection().runs.at(-1)?.status).toBe("failed");
+    expect(harness.projection().runs.at(-1)?.startedAt).not.toBeNull();
+    expect(harness.projection().turnItems.at(-1)).toMatchObject({
+      type: "error",
+      status: "failed",
+      failure: {
+        class: "validation_error",
+        code: "model_not_allowed",
+        message: "Model not allowed: gpt-5.4",
+      },
+    });
+  }).pipe(withProductionAllowlist),
+);
+
+effectIt.effect("still runs an account command on a blocked model", () =>
+  Effect.gen(function* () {
+    const harness = makeLocalCommandHarness({ text: "/logout", previousNativeSession: true });
+
+    yield* harness.start;
+
+    expect(harness.tryHandlePromptCommand).toHaveBeenCalledOnce();
+    expect(harness.open).not.toHaveBeenCalled();
+    expect(harness.projection().runs.at(-1)?.status).toBe("completed");
+  }).pipe(withProductionAllowlist),
 );
 
 effectIt.effect("recovers an abandoned failed turn before continuing its native conversation", () =>

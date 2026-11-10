@@ -55,6 +55,7 @@ import {
   knownProviderFailureMessage,
   makeProviderFailure,
 } from "@t3tools/provider-core/server/failure";
+import { isModelAllowed, modelNotAllowedFailure } from "../provider/allowedModels.ts";
 import * as RunExecutionService from "./RunExecutionService.ts";
 import * as RuntimePolicy from "./RuntimePolicy.ts";
 import {
@@ -632,6 +633,25 @@ export const layer: Layer.Layer<
           });
           return;
         }
+      }
+      // fork:model-allowlist: every run starts here, so this is the one turn-start check; account
+      // commands above still run. Not settleStartFailure: its provider_error makes the pilot hop.
+      if (!isModelAllowed(run.modelSelection.model, providerThread.driver)) {
+        const now = yield* DateTime.now;
+        yield* settleRunBeforeStart({
+          signal: "model-not-allowed",
+          status: "failed",
+          now,
+          startedAt: now,
+          providerInstanceId: run.providerInstanceId,
+          itemProviderThreadId: providerThread.id,
+          item: {
+            type: "error",
+            title: "Model not allowed",
+            failure: modelNotAllowedFailure(run.modelSelection.model),
+          },
+        });
+        return;
       }
       const { worktreePath, branch } = projection.thread;
       if (worktreePath !== null && branch !== null) {

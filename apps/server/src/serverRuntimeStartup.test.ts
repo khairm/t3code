@@ -60,6 +60,9 @@ it.effect.each([
         scenario === "disabled-default" ? "custom" : "codex",
       );
       const events: ServerLifecycleStreamEvent[] = [];
+      const activated = yield* Deferred.make<void>();
+      // fork:model-allowlist
+      const heldRunsResumed = yield* Deferred.make<void>();
       const recovery = {
         terminalizedRuns: 0,
         stoppedSessions: 0,
@@ -115,7 +118,10 @@ it.effect.each([
           prepareForShutdown: Effect.void,
           reconcile: () => Effect.succeed(recovery),
         }),
-        Layer.mock(Orchestrator.OrchestratorV2)({ recoverDelegatedTasks: Effect.void }),
+        Layer.mock(Orchestrator.OrchestratorV2)({
+          recoverDelegatedTasks: Effect.void,
+          resumeQueuedRuns: Deferred.succeed(heldRunsResumed, undefined).pipe(Effect.as(0)),
+        }),
         Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({ shutdown: Effect.void }),
         Layer.mock(AgentAwarenessRelay.AgentAwarenessRelay)({ start: () => Effect.void }),
         Layer.mock(EffectWorker.OrchestrationEffectWorkerV2)({ runOnce: Effect.never }),
@@ -151,7 +157,7 @@ it.effect.each([
             capabilities: { repositoryIdentity: true },
           }),
         }),
-        Layer.mock(ProjectStore.ProjectStoreV2)({}),
+        Layer.mock(ProjectStore.ProjectStoreV2)({ listShells: () => Effect.succeed([]) }),
         Layer.mock(ProjectService.ProjectService)({
           bootstrap: () =>
             scenario === "project-failure"
@@ -219,6 +225,9 @@ it.effect.each([
         yield* startup.markHttpListening;
         const ready = yield* Effect.exit(startup.awaitCommandReady);
         assert.equal(Exit.isSuccess(ready), scenario !== "project-failure");
+        // fork:model-allowlist: the runs the restart hold queued start once the server is active.
+        yield* Deferred.succeed(activated, undefined);
+        if (scenario !== "project-failure") yield* Deferred.await(heldRunsResumed);
         const welcome = events.find((event) => event.type === "welcome");
         if (scenario === "project-failure") {
           assert.isUndefined(welcome);
@@ -231,7 +240,7 @@ it.effect.each([
         }
       }).pipe(
         Effect.provide(ServerRuntimeStartup.layerWithOptions().pipe(Layer.provide(dependencies))),
-        Effect.provideService(ServerActivation, Effect.never),
+        Effect.provideService(ServerActivation, Deferred.await(activated)),
       );
     }),
   ),

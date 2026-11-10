@@ -1,5 +1,7 @@
+import * as DateTime from "effect/DateTime";
 import * as Mime from "effect/http/Mime";
 import {
+  AuthEnvironmentMaintainScope,
   AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
   EnvironmentHttpApi,
@@ -47,6 +49,7 @@ import {
   failEnvironmentInternal,
 } from "./auth/http.ts";
 import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
+import * as QueuePromotionHold from "./orchestration-v2/QueuePromotionHold.ts";
 import { WEBHOOK_ROUTE_PREFIX } from "./scheduledTasks/ScheduledTaskService.ts";
 import {
   browserApiCorsAllowedHeaders,
@@ -291,7 +294,10 @@ function resolveDevRedirectUrl(devUrl: URL, requestUrl: URL): string {
 const authenticateRawRouteWithScope =
   /* Request instrumentation already owns the span; keep this helper in that context. */
   Effect.fnUntraced(function* (
-    scope: typeof AuthOrchestrationReadScope | typeof AuthOrchestrationOperateScope,
+    scope:
+      | typeof AuthOrchestrationReadScope
+      | typeof AuthOrchestrationOperateScope
+      | typeof AuthEnvironmentMaintainScope,
   ) {
     const request = yield* HttpServerRequest.HttpServerRequest;
     const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
@@ -384,6 +390,96 @@ export const layerOtlpTracesProxyRoute = HttpRouter.add(
     }),
     Effect.withTracerEnabled(false),
   ),
+);
+
+// fork:model-allowlist: the idle-gated restart holds new runs (drain), asks for the cutover once
+// no run is busy, then restarts. The restart, the release route or the expiry clears the hold.
+export const HOLD_QUEUE_PROMOTION_PATH = "/api/server/hold-queue-promotion";
+export const RELEASE_QUEUE_PROMOTION_PATH = "/api/server/release-queue-promotion";
+const QueuePromotionHoldRequest = Schema.Union([
+  Schema.Struct({ phase: Schema.optional(Schema.Literal("drain")) }),
+  Schema.Struct({ phase: Schema.Literal("cutover"), generation: Schema.Int }),
+]);
+const decodeQueuePromotionHoldRequest = Schema.decodeEffect(
+  Schema.fromJsonString(QueuePromotionHoldRequest),
+);
+
+const queuePromotionErrorJson = (status: number, error: string, message: string) =>
+  HttpServerResponse.jsonUnsafe({ error, message }, { status });
+
+/** Every status body carries `busy` (see `QueuePromotionHoldShape.busy`), which the restart waits to see at 0. */
+const queuePromotionRoute = (
+  method: "GET" | "POST",
+  path: HttpRouter.PathInput,
+  handle: (
+    hold: QueuePromotionHold.QueuePromotionHoldShape,
+  ) => Effect.Effect<
+    QueuePromotionHold.QueuePromotionHoldStatus,
+    | QueuePromotionHold.QueuePromotionHoldLockWaitError
+    | QueuePromotionHold.QueuePromotionHoldStaleError
+    | Schema.SchemaError,
+    HttpServerRequest.HttpServerRequest
+  >,
+) =>
+  HttpRouter.add(
+    method,
+    path,
+    Effect.gen(function* () {
+      yield* authenticateRawRouteWithScope(AuthEnvironmentMaintainScope);
+      const hold = yield* QueuePromotionHold.QueuePromotionHold;
+      const status = yield* handle(hold);
+      return HttpServerResponse.jsonUnsafe({
+        ...(status.held
+          ? {
+              ...status,
+              heldSince: DateTime.formatIso(status.heldSince),
+              expiresAt: DateTime.formatIso(status.expiresAt),
+            }
+          : status),
+        busy: yield* hold.busy,
+      });
+    }).pipe(
+      Effect.catchTags({
+        EnvironmentAuthInvalidError: HttpServerRespondable.toResponse,
+        EnvironmentInternalError: HttpServerRespondable.toResponse,
+        EnvironmentScopeRequiredError: HttpServerRespondable.toResponse,
+        QueuePromotionHoldLockWaitError: (error) =>
+          Effect.succeed(queuePromotionErrorJson(503, "lock_wait_timeout", error.message)),
+        QueuePromotionHoldStaleError: (error) =>
+          Effect.succeed(queuePromotionErrorJson(409, "stale_generation", error.message)),
+        SchemaError: (error) =>
+          Effect.succeed(queuePromotionErrorJson(400, "invalid_request", error.message)),
+      }),
+    ),
+  );
+
+/**
+ * `{}` sets a drain hold or refreshes the current one in its phase; `{"phase":"drain"}` also brings
+ * a cutover back to drain; `{"phase":"cutover","generation":n}` moves that hold to cutover.
+ */
+export const layerHoldQueuePromotionRoute = queuePromotionRoute(
+  "POST",
+  HOLD_QUEUE_PROMOTION_PATH,
+  Effect.fnUntraced(function* (hold) {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const text = yield* request.text.pipe(Effect.orDie);
+    const body = yield* decodeQueuePromotionHoldRequest(text.trim() === "" ? "{}" : text);
+    return yield* body.phase === "cutover"
+      ? hold.cutover(body.generation)
+      : body.phase === "drain"
+        ? hold.drain
+        : hold.hold;
+  }),
+);
+export const layerReleaseQueuePromotionRoute = queuePromotionRoute(
+  "POST",
+  RELEASE_QUEUE_PROMOTION_PATH,
+  (hold) => Effect.andThen(hold.release, hold.status),
+);
+export const layerQueuePromotionStatusRoute = queuePromotionRoute(
+  "GET",
+  HOLD_QUEUE_PROMOTION_PATH,
+  (hold) => hold.status,
 );
 
 const UNTRACED_REQUEST_PATHS: ReadonlySet<string> = new Set([OTLP_TRACES_PROXY_PATH]);

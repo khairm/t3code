@@ -30,7 +30,9 @@ import {
 import { checkpointWorkspace } from "@t3tools/provider-testing/replayWorkspace";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
+import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Queue from "effect/Queue";
@@ -58,6 +60,7 @@ import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
 import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
+import { withProductionAllowlist } from "../provider/allowedModels.testkit.ts";
 import { buildUnavailableProviderSnapshot } from "../provider/unavailableProviderSnapshot.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
@@ -1831,6 +1834,115 @@ describe("OrchestratorMcpService provider resolution", () => {
         );
       }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(layerDependencies))));
     }),
+  );
+
+  // fork:model-allowlist
+  it.effect(
+    "refuses a blocked delegate model, explicit or inherited, and lists only allowed ones",
+    () =>
+      Effect.gen(function* () {
+        const luna = { instanceId: codexInstanceId, model: "gpt-6-luna" };
+        const layerDependencies = Layer.mergeAll(
+          NodeServices.layer,
+          NodeCrypto.layer,
+          Layer.mock(ThreadManagementService.ThreadManagementService)({
+            hasReceipt: () => Effect.succeed(false),
+            assertProviderInstanceEnabled: () => Effect.void,
+            getThreadRecords: () => Effect.succeed(parentProjection([], luna)),
+          }),
+          ServerSettings.layerTest(),
+          providerRegistryLayer([
+            {
+              ...providerSnapshot({
+                instanceId: codexInstanceId,
+                driver: ProviderDriverKind.make("codex"),
+              }),
+              models: ["gpt-6-luna", "gpt-6.1-sol"].map((slug) => ({
+                slug,
+                name: slug,
+                isCustom: false,
+                capabilities: null,
+              })),
+            },
+          ]),
+          adapterRegistryLayer([codexInstanceId]),
+          Layer.mock(ProjectService.ProjectService)({}),
+          Layer.mock(SecretRequests.SecretRequests)({}),
+          Layer.mock(RemoteDelegation.RemoteDelegation)({}),
+          Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+        );
+
+        yield* Effect.gen(function* () {
+          const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+          for (const target of [{ providerInstanceId: codexInstanceId, model: "gpt-6-luna" }, {}]) {
+            const refused = yield* service
+              .delegateTask(scope, {
+                task: "Review the change.",
+                target: yield* decodeTarget(target),
+                mode: "async",
+              })
+              .pipe(Effect.flip);
+            assert.equal(refused.code, "model_unavailable");
+            assert.equal(refused.message, "model gpt-6-luna is not allowed");
+          }
+          const { providers } = yield* service.capabilities(scope);
+          assert.deepEqual(
+            providers[0]?.models.map((model) => model.id),
+            ["gpt-6.1-sol"],
+          );
+        }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(layerDependencies))));
+      }).pipe(withProductionAllowlist),
+  );
+
+  // fork:model-allowlist
+  it.effect("checks a delegate model by the allowlist alone while the provider list loads", () =>
+    Effect.gen(function* () {
+      const layerDependencies = Layer.mergeAll(
+        NodeServices.layer,
+        NodeCrypto.layer,
+        Layer.mock(ThreadManagementService.ThreadManagementService)({
+          hasReceipt: () => Effect.succeed(false),
+          assertProviderInstanceEnabled: () => Effect.void,
+          getThreadRecords: () =>
+            Effect.succeed(
+              parentProjection([], { instanceId: codexInstanceId, model: "gpt-6.1-sol" }),
+            ),
+        }),
+        ServerSettings.layerTest(),
+        providerRegistryLayer([
+          {
+            ...providerSnapshot({
+              instanceId: codexInstanceId,
+              driver: ProviderDriverKind.make("codex"),
+            }),
+            models: [],
+          },
+        ]),
+        adapterRegistryLayer([codexInstanceId]),
+        Layer.mock(ProjectService.ProjectService)({}),
+        Layer.mock(SecretRequests.SecretRequests)({}),
+        Layer.mock(RemoteDelegation.RemoteDelegation)({}),
+        Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+      );
+
+      yield* Effect.gen(function* () {
+        const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+        const delegate = (model: string) =>
+          Effect.gen(function* () {
+            return yield* service.delegateTask(scope, {
+              task: "Review the change.",
+              target: yield* decodeTarget({ providerInstanceId: codexInstanceId, model }),
+              mode: "async",
+            });
+          }).pipe(Effect.exit);
+        const blocked = yield* delegate("gpt-6-luna");
+        assert.include(Exit.isFailure(blocked) ? Cause.pretty(blocked.cause) : "", "not allowed");
+        const allowed = yield* delegate("gpt-6.1-sol");
+        const allowedFailure = Exit.isFailure(allowed) ? Cause.pretty(allowed.cause) : "";
+        assert.notInclude(allowedFailure, "not advertised");
+        assert.notInclude(allowedFailure, "not allowed");
+      }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(layerDependencies))));
+    }).pipe(withProductionAllowlist),
   );
 
   it.effect("driver-only delegation skips an instance the project turned off", () =>

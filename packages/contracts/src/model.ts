@@ -128,12 +128,9 @@ const OPENCODE_DRIVER_KIND = ProviderDriverKind.make("opencode");
 export const DEFAULT_MODEL = "gpt-6-astra";
 
 /** First model present in model/list wins; otherwise use Codex's isDefault. */
-export const PREFERRED_DEFAULT_CODEX_MODELS: ReadonlyArray<string> = [
-  DEFAULT_MODEL,
-  "gpt-5.6-sol",
-  "gpt-5.6-terra",
-];
-export const DEFAULT_TEXT_GENERATION_MODEL = "gpt-6-luna";
+// fork:model-allowlist: allowed models only.
+export const PREFERRED_DEFAULT_CODEX_MODELS: ReadonlyArray<string> = [DEFAULT_MODEL, "gpt-6.1-sol"];
+export const DEFAULT_TEXT_GENERATION_MODEL = "gpt-6.1-sol";
 /** Keep the official Antigravity session's current model. Never send this ID to ACP. */
 export const ANTIGRAVITY_DEFAULT_MODEL = "antigravity-default";
 export const DEFAULT_TEXT_GENERATION_REASONING_EFFORT = "low";
@@ -163,7 +160,8 @@ export const DEFAULT_TEXT_GENERATION_MODEL_BY_PROVIDER: Partial<
 > = {
   [CODEX_DRIVER_KIND]: DEFAULT_TEXT_GENERATION_MODEL,
   [ProviderDriverKind.make("antigravity")]: ANTIGRAVITY_DEFAULT_MODEL,
-  [CLAUDE_DRIVER_KIND]: "claude-haiku-5-5",
+  // fork:model-allowlist: the small-model slot stays on Opus 5.5.
+  [CLAUDE_DRIVER_KIND]: "claude-opus-5-5",
   [CURSOR_DRIVER_KIND]: "composer-2",
   [OPENCODE_DRIVER_KIND]: "opencode/big-pickle",
 };

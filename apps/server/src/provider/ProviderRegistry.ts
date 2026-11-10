@@ -26,6 +26,7 @@ import * as Semaphore from "effect/Semaphore";
 import * as ProviderLatestVersions from "@t3tools/provider-core/server/ProviderLatestVersions";
 import * as ModelManifest from "./ModelManifest.ts";
 import { applyProviderCompatibility } from "./providerCompatibility.ts";
+import { filterAllowedProviderModels } from "./allowedModels.ts";
 import * as ServerConfig from "../config.ts";
 import * as ProviderInstanceRegistry from "./ProviderInstanceRegistry.ts";
 import * as ProviderInstanceRegistryMutator from "./ProviderInstanceRegistryMutator.ts";
@@ -424,10 +425,13 @@ export const layer = Layer.effect(
       provider: ServerProvider,
       manifest: ModelManifest.ModelManifestData,
     ) =>
-      applyProviderCompatibility(
-        provider,
-        manifest.compatibility,
-        ModelManifest.BUNDLED_MODEL_MANIFEST.compatibility,
+      // fork:model-allowlist: after cache hydration and every merge.
+      filterAllowedProviderModels(
+        applyProviderCompatibility(
+          provider,
+          manifest.compatibility,
+          ModelManifest.BUNDLED_MODEL_MANIFEST.compatibility,
+        ),
       );
     const providersRef = yield* Ref.make<ReadonlyArray<ServerProvider>>(
       cachedProviders.map((provider) => classifyCompatibility(provider, initialManifest)),

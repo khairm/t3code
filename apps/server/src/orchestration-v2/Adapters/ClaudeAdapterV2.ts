@@ -36,6 +36,7 @@ import {
   type ClaudeModelLedger,
 } from "../../provider/ClaudeTurnTokenUsage.ts";
 import { toMcpElicitationResponse } from "../../provider/CodexMcpElicitation.ts";
+import { MODEL_NOT_ALLOWED_CODE } from "../../provider/allowedModels.ts";
 import {
   type CanUseTool,
   type ElicitationRequest,
@@ -4127,6 +4128,19 @@ function providerFailureFromResult(
       code: "api_error_429",
       retryable: true,
       resetAt: gatewayResetAt,
+    });
+  }
+  // fork:model-allowlist: the gateway refuses a blocked model with a 400 coded model_not_allowed.
+  if (
+    message.subtype === "success" &&
+    message.api_error_status === 400 &&
+    /"code"\s*:\s*"model_not_allowed"/.test(message.result)
+  ) {
+    return makeProviderFailure({
+      message: message.result,
+      code: MODEL_NOT_ALLOWED_CODE,
+      class: "validation_error",
+      retryable: false,
     });
   }
   const failureClass =

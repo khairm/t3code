@@ -1,7 +1,7 @@
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
-import type { ModelSelection, ProviderInstanceId } from "@t3tools/contracts";
+import type { ModelSelection } from "@t3tools/contracts";
 import {
   isProviderAvailable,
   isProviderTextGenerationCapable,
@@ -18,7 +18,7 @@ import type { ProviderTextGeneration } from "@t3tools/provider-core/server/textG
 import { TextGenerationError } from "@t3tools/contracts";
 
 import * as ProviderInstanceRegistry from "../provider/ProviderInstanceRegistry.ts";
-import type { ProviderInstance } from "@t3tools/provider-core/server/driver";
+import { isModelAllowed, modelNotAllowedMessage } from "../provider/allowedModels.ts";
 import * as SourceControlProviderRegistry from "../sourceControl/SourceControlProviderRegistry.ts";
 import * as ThreadTitleLinks from "./ThreadTitleLinks.ts";
 
@@ -48,24 +48,6 @@ type TextGenerationOp =
   | "generateThreadTitle"
   | "generateReviewGuide"
   | "generateTranscriptionPostProcessing";
-
-const resolveInstance = (
-  registry: ProviderInstanceRegistry.ProviderInstanceRegistry["Service"],
-  operation: TextGenerationOp,
-  instanceId: ProviderInstanceId,
-): Effect.Effect<ProviderInstance["textGeneration"], TextGenerationError> =>
-  registry.getInstance(instanceId).pipe(
-    Effect.flatMap((instance) =>
-      instance
-        ? Effect.succeed(instance.textGeneration)
-        : Effect.fail(
-            new TextGenerationError({
-              operation,
-              detail: `No provider instance registered for id '${instanceId}'.`,
-            }),
-          ),
-    ),
-  );
 
 // Review guides investigate the checkout read-only; the other drivers reject that request.
 const INVESTIGATING_DRIVERS = new Set(["codex", "claudeAgent"]);
@@ -121,15 +103,29 @@ export const make = Effect.gen(function* () {
               isProviderAvailable(provider) &&
               isProviderTextGenerationCapable(provider) &&
               (operation !== "generateReviewGuide" || INVESTIGATING_DRIVERS.has(driver)) &&
+              // fork:model-allowlist
+              isModelAllowed(defaultTextGenerationModel(driver), driver) &&
               !exhaustedUsageWindow(provider, now, defaultTextGenerationModel(driver))
             );
           },
           { includeConfiguredInstances: true },
         ) ?? selection;
     }
-    return yield* resolveInstance(registry, operation, selection.instanceId).pipe(
-      Effect.flatMap((service) => invoke(service, selection)),
-    );
+    const instance = yield* registry.getInstance(selection.instanceId);
+    if (!instance) {
+      return yield* new TextGenerationError({
+        operation,
+        detail: `No provider instance registered for id '${selection.instanceId}'.`,
+      });
+    }
+    // fork:model-allowlist: the final selection, after any usage-limit fallback.
+    if (!isModelAllowed(selection.model, instance.driverKind)) {
+      return yield* new TextGenerationError({
+        operation,
+        detail: modelNotAllowedMessage(selection.model),
+      });
+    }
+    return yield* invoke(instance.textGeneration, selection);
   });
   return TextGeneration.of({
     generateCommitMessage: Effect.fn("TextGeneration.generateCommitMessage")(function (input) {

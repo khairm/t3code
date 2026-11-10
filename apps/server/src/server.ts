@@ -776,6 +776,10 @@ const layerMakeRoutes = Layer.mergeAll(
       Layer.provide(AuthHttp.layerAuthenticatedAuth),
     ),
     ServerHttp.layerOtlpTracesProxyRoute,
+    // fork:model-allowlist
+    ServerHttp.layerHoldQueuePromotionRoute,
+    ServerHttp.layerReleaseQueuePromotionRoute,
+    ServerHttp.layerQueuePromotionStatusRoute,
     ServerHttp.layerAssetRoute,
     ServerHttp.layerAttachmentUploadRoute,
     GuestHttp.layer,
