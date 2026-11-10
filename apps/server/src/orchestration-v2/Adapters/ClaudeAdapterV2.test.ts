@@ -6704,54 +6704,6 @@ describe("ClaudeAdapterV2 background wake turns", () => {
     ),
   );
 
-  // fork:model-allowlist
-  it.effect(
-    "records the gateway's model_not_allowed 400 as model_not_allowed, not provider_error",
-    () =>
-      Effect.gen(function* () {
-        const harness = yield* makeWakeHarness;
-        const now = yield* DateTime.now;
-        yield* harness.runtime.startTurn(
-          makeClaudeTestTurnInput({
-            threadId: harness.threadId,
-            providerThread: harness.providerThread,
-            now,
-            attemptId: RunAttemptId.make("attempt-claude-model-not-allowed"),
-            text: "Continue.",
-            attachments: [],
-          }),
-        );
-        const cliText =
-          'API Error: 400 {"type":"error","error":{"type":"invalid_request_error","code":"model_not_allowed","message":"model not allowed: claude-sonnet-5-5"}}';
-        yield* Queue.offer(
-          harness.sdkMessages,
-          makeResultFrame({
-            uuid: "00000000-0000-4000-8000-000000000610",
-            result: cliText,
-            isError: true,
-            apiErrorStatus: 400,
-            terminalReason: "api_error",
-          }),
-        );
-
-        const terminal = yield* Queue.take(harness.terminalReceipts);
-        assert.equal(terminal.status, "failed");
-        if (terminal.status !== "failed") return;
-        assert.equal(terminal.failure.code, "model_not_allowed");
-        assert.equal(terminal.failure.class, "validation_error");
-        assert.include(terminal.failure.message, "model not allowed: claude-sonnet-5-5");
-      }).pipe(
-        Effect.provide(
-          Layer.mergeAll(
-            IdAllocator.layer,
-            McpProviderSessions.layer,
-            NodeServices.layer,
-            NodeCrypto.layer,
-          ),
-        ),
-      ),
-  );
-
   const lastProviderTurn = (events: ReadonlyArray<ProviderAdapter.ProviderAdapterV2Event>) => {
     const event = events.findLast((candidate) => candidate.type === "provider_turn.updated");
     if (event?.type !== "provider_turn.updated") {

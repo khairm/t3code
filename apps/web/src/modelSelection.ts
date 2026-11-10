@@ -140,18 +140,14 @@ function applyInstanceModelPreferences(
 function normalizeCustomModelEntries(
   models: ReadonlyArray<CustomModelDefinition>,
   builtInModelSlugs: ReadonlySet<string>,
-  serverModels: ReadonlyArray<{ readonly slug: string }>,
 ): CustomModelDefinition[] {
   const normalizedModels: CustomModelDefinition[] = [];
   const seen = new Set<string>();
-  // fork:model-allowlist: a settings custom model shows only once the server lists it.
-  const serverModelSlugs = new Set(serverModels.map((model) => model.slug));
 
   for (const candidate of models) {
     if (
       candidate.slug.length > MAX_CUSTOM_MODEL_LENGTH ||
       builtInModelSlugs.has(candidate.slug) ||
-      !serverModelSlugs.has(candidate.slug) ||
       seen.has(candidate.slug)
     ) {
       continue;
@@ -184,7 +180,7 @@ function getAppModelOptions(
 
   const defaultInstanceId = defaultInstanceIdForDriver(provider);
   const customModels = readInstanceCustomModels(settings, defaultInstanceId, provider);
-  for (const entry of normalizeCustomModelEntries(customModels, builtInModelSlugs, rawModels)) {
+  for (const entry of normalizeCustomModelEntries(customModels, builtInModelSlugs)) {
     if (seen.has(entry.slug)) {
       continue;
     }
@@ -225,7 +221,7 @@ export function getAppModelOptionsForInstance(
   );
 
   const customModels = readInstanceCustomModels(settings, entry.instanceId, entry.driverKind);
-  for (const custom of normalizeCustomModelEntries(customModels, builtInModelSlugs, entry.models)) {
+  for (const custom of normalizeCustomModelEntries(customModels, builtInModelSlugs)) {
     if (seen.has(custom.slug)) {
       continue;
     }

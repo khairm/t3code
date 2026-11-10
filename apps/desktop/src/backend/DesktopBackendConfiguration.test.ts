@@ -695,8 +695,6 @@ describe("DesktopBackendConfiguration", () => {
         assert.include((config.env.WSLENV ?? "").split(":"), "T3CODE_TELEMETRY_ENABLED");
         assert.equal(config.env.OTEL_RESOURCE_ATTRIBUTES, "deployment.environment.name=staging");
         assert.include((config.env.WSLENV ?? "").split(":"), "OTEL_RESOURCE_ATTRIBUTES");
-        assert.equal(config.env.T3_ALLOWED_MODELS, "gpt-6-astra,claude-opus-5-5");
-        assert.include((config.env.WSLENV ?? "").split(":"), "T3_ALLOWED_MODELS");
       }).pipe(
         Effect.provide(
           layerBackendConfiguration().pipe(
@@ -717,8 +715,6 @@ describe("DesktopBackendConfiguration", () => {
           OTEL_SDK_DISABLED: "true",
           T3CODE_TELEMETRY_ENABLED: "false",
           OTEL_RESOURCE_ATTRIBUTES: "deployment.environment.name=staging",
-          // fork:model-allowlist: the WSL server refuses to start without it.
-          T3_ALLOWED_MODELS: "gpt-6-astra,claude-opus-5-5",
         }),
       );
     }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),

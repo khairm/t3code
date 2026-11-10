@@ -74,8 +74,6 @@ import * as ModelManifest from "../../provider/ModelManifest.ts";
 import * as PortScanner from "../../preview/PortScanner.ts";
 import { resolveProviderCompatibility } from "../../provider/providerCompatibility.ts";
 import * as CodexAdapterV2 from "./CodexAdapterV2.ts";
-import { CODEX_HELPERS_OFF_CONFIG } from "../../provider/allowedModels.ts";
-import { withProductionAllowlist } from "../../provider/allowedModels.testkit.ts";
 import { withCodexReplayChildMetadata } from "./CodexAdapterV2.testkit.ts";
 import * as CodexAdapterV2Testkit from "./CodexAdapterV2.testkit.ts";
 
@@ -1629,9 +1627,6 @@ describe("CodexAdapterV2 post-settle continuation", () => {
           config: {
             "tools.update_plan.enabled": true,
             mcp_optional_startup_grace_ms: 10_000,
-            // fork:model-allowlist
-            "agents.enabled": false,
-            "features.multi_agent_v2": false,
             "shell_environment_policy.set.T3CODE_THREAD_ID": `thread-${scenario}`,
             "mcp_servers.t3-code": {
               url: "http://127.0.0.1:43123/mcp",
@@ -1676,19 +1671,11 @@ describe("CodexAdapterV2 post-settle continuation", () => {
           http_headers: { Authorization: "Bearer current-token" },
         },
         "mcp_servers.extra.command": "cat",
-        // fork:model-allowlist: every thread sends these; the recordings predate them.
-        ...CODEX_HELPERS_OFF_CONFIG,
       };
-      for (const [recordedMcp, drift] of [
-        [{ mcp_servers: { "t3-code": recordedServer } }, { "tools.update_plan.enabled": false }],
-        [
-          { "mcp_servers.t3-code": recordedServer, "mcp_servers.extra.command": "echo" },
-          { "tools.update_plan.enabled": false },
-        ],
-        // A request that turns helpers back on mismatches a recording that never named them.
-        [{ mcp_servers: { "t3-code": recordedServer } }, { "agents.enabled": true }],
-        [{ mcp_servers: { "t3-code": recordedServer } }, { "features.multi_agent_v2": true }],
-      ] as const) {
+      for (const recordedMcp of [
+        { mcp_servers: { "t3-code": recordedServer } },
+        { "mcp_servers.t3-code": recordedServer, "mcp_servers.extra.command": "echo" },
+      ]) {
         const entries = codexReplayPreamble({
           nativeThreadId: "replayed-mcp-thread",
           nativeTurnId: "unused",
@@ -1724,7 +1711,9 @@ describe("CodexAdapterV2 post-settle continuation", () => {
           assert.equal(response.thread.id, "replayed-mcp-thread");
           assert.isNull((yield* Ref.get(driver.state)).failure);
           yield* client
-            .request("thread/start", { config: { ...currentConfig, ...drift } })
+            .request("thread/start", {
+              config: { ...currentConfig, "tools.update_plan.enabled": false },
+            })
             .pipe(Effect.flip);
           assert.instanceOf(
             (yield* Ref.get(driver.state)).failure,
@@ -1827,86 +1816,6 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       assert.lengthOf(harness.terminalEvents(), 1);
       assert.isFalse(yield* harness.hasPendingBackgroundWork);
     }).pipe(
-      Effect.scoped,
-      Effect.provide(
-        Layer.mergeAll(
-          IdAllocator.layer,
-          McpProviderSessions.layer,
-          NodeServices.layer,
-          NodeCrypto.layer,
-        ),
-      ),
-    ),
-  );
-
-  // fork:model-allowlist
-  it.effect("fails a turn Codex reroutes to a blocked model, as a blocked start does", () =>
-    Effect.gen(function* () {
-      const nativeThreadId = "blocked-reroute-thread";
-      const nativeTurnId = "blocked-reroute-turn";
-      const prompt = "Run a command.";
-      const harness = yield* makeCodexReplayHarness(
-        makeCodexReplayTranscript({
-          scenario: "blocked-model-reroute",
-          entries: [
-            ...codexReplayPreamble({ nativeThreadId, nativeTurnId, prompt }),
-            {
-              type: "emit_inbound",
-              label: "model/rerouted",
-              frame: {
-                method: "model/rerouted",
-                params: {
-                  threadId: nativeThreadId,
-                  turnId: nativeTurnId,
-                  fromModel: "gpt-6-astra",
-                  toModel: "gpt-6-luna",
-                  reason: "highRiskCyberActivity",
-                },
-              },
-            },
-            {
-              type: "expect_outbound",
-              label: "turn/interrupt",
-              frame: {
-                id: 4,
-                method: "turn/interrupt",
-                params: { threadId: nativeThreadId, turnId: nativeTurnId },
-              },
-            },
-            { type: "emit_inbound", label: "turn/interrupt", frame: { id: 4, result: {} } },
-            {
-              type: "emit_inbound",
-              label: "turn/completed",
-              frame: {
-                method: "turn/completed",
-                params: {
-                  threadId: nativeThreadId,
-                  turn: makeCodexReplayTurn({ id: nativeTurnId, status: "interrupted" }),
-                },
-              },
-            },
-          ],
-        }),
-      );
-      yield* harness.runtime.startTurn(
-        makeCodexTestTurnInput({
-          threadId: harness.threadId,
-          providerThread: harness.providerThread,
-          now: yield* DateTime.now,
-          attemptId: RunAttemptId.make("blocked-reroute-attempt"),
-          text: prompt,
-        }),
-      );
-      yield* harness.firstTerminal;
-      const terminal = harness.terminalEvents()[0];
-      assert.equal(terminal?.status, "failed");
-      assert.deepInclude(terminal?.status === "failed" ? terminal.failure : {}, {
-        class: "validation_error",
-        code: "model_not_allowed",
-        message: "Model not allowed: gpt-6-luna",
-      });
-    }).pipe(
-      withProductionAllowlist,
       Effect.scoped,
       Effect.provide(
         Layer.mergeAll(
@@ -2753,12 +2662,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
                 params: {
                   threadId: nativeThreadId,
                   excludeTurns: true,
-                  // fork:model-allowlist: helpers stay off on a resume.
-                  config: {
-                    ...CodexAdapterV2.CODEX_THREAD_CONFIG,
-                    "agents.enabled": false,
-                    "features.multi_agent_v2": false,
-                  },
+                  config: CodexAdapterV2.CODEX_THREAD_CONFIG,
                 },
               },
             },
@@ -8297,15 +8201,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
               frame: {
                 id: 3,
                 method: "thread/fork",
-                params: {
-                  threadId: nativeThreadId,
-                  // fork:model-allowlist: helpers stay off on a fork.
-                  config: {
-                    ...CodexAdapterV2.CODEX_THREAD_CONFIG,
-                    "agents.enabled": false,
-                    "features.multi_agent_v2": false,
-                  },
-                },
+                params: { threadId: nativeThreadId, config: CodexAdapterV2.CODEX_THREAD_CONFIG },
               },
             },
             {

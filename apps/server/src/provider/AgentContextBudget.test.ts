@@ -108,9 +108,6 @@ const codexAdditionalContext = () =>
     .map((entry) => entry.value)
     .join("");
 
-// fork:model-allowlist
-const FORK_SUBAGENT_LINE_EXTRA_BYTES = 43;
-
 const layerAdvertisedTools = McpHttpServer.layerTools.pipe(
   Layer.provideMerge(McpHttpServer.layerInProcessMcpServer),
   Layer.provide(toolHandlerServices),
@@ -147,17 +144,9 @@ it.effect("agent context matches the committed budget", () =>
       ),
     };
 
-    // fork:model-allowlist: agentContextBudget.json stays upstream's; the fork's subagent line
-    // (Codex always uses delegate_task) is longer by FORK_SUBAGENT_LINE_EXTRA_BYTES.
-    const forkBudget = {
-      ...budget,
-      claudeSystemAppendBytes: budget.claudeSystemAppendBytes + FORK_SUBAGENT_LINE_EXTRA_BYTES,
-      codexAdditionalContextBytes:
-        budget.codexAdditionalContextBytes + FORK_SUBAGENT_LINE_EXTRA_BYTES,
-    };
     expect(
       measured,
-      "Set agentContextBudget.json to upstream's measured values, or FORK_SUBAGENT_LINE_EXTRA_BYTES to the fork line's extra bytes. Before you cut text to fit, run the evals that cover it (evals/README.md).",
-    ).toEqual(forkBudget);
+      "Set agentContextBudget.json to the measured values. Before you cut text to fit, run the evals that cover it (evals/README.md).",
+    ).toEqual(budget);
   }).pipe(Effect.provide(layerAdvertisedTools)),
 );

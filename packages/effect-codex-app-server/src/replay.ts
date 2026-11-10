@@ -236,21 +236,12 @@ function recorderThreadConfigKeys(transcript: CodexAppServerReplayTranscript): R
   return new Set(Array.isArray(keys) ? keys.filter((key) => typeof key === "string") : []);
 }
 
-// fork:model-allowlist: the fork turns Codex helpers off on every thread. Upstream's recordings
-// predate that, so a recorded thread request reads as if it asked for it; the actual request is
-// never touched, so one that turns helpers back on mismatches.
-const CODEX_HELPERS_OFF_KEYS = ["agents.enabled", "features.multi_agent_v2"] as const;
-
 /**
  * `cwd`, `model`, host-supplied MCP servers (machine-local URLs, short-lived
  * authorization headers) and the T3 thread id vary per machine or run, and
  * recorder-only keys are not the client's.
  */
-function normalizeThreadRequest(
-  frame: unknown,
-  ignoredConfigKeys: ReadonlySet<string>,
-  side: "recorded" | "actual",
-): unknown {
+function normalizeThreadRequest(frame: unknown, ignoredConfigKeys: ReadonlySet<string>): unknown {
   if (typeof frame !== "object" || frame === null) return frame;
   const record = frame as Record<string, unknown>;
   if (
@@ -273,22 +264,21 @@ function normalizeThreadRequest(
     ),
   );
   for (const key of ignoredConfigKeys) delete owned[key];
-  if (side === "recorded") for (const key of CODEX_HELPERS_OFF_KEYS) owned[key] ??= false;
   return { ...record, params: { ...params, config: owned } };
 }
 
 function sameFrame(
-  recorded: unknown,
-  actual: unknown,
+  left: unknown,
+  right: unknown,
   ignoredConfigKeys: ReadonlySet<string> = new Set(),
 ): boolean {
-  const normalize = (frame: unknown, side: "recorded" | "actual") =>
+  const normalize = (frame: unknown) =>
     pipe(
       normalizeReplayFrame(frame),
-      (request) => normalizeThreadRequest(request, ignoredConfigKeys, side),
+      (request) => normalizeThreadRequest(request, ignoredConfigKeys),
       stableStringify,
     );
-  return normalize(recorded, "recorded") === normalize(actual, "actual");
+  return normalize(left) === normalize(right);
 }
 
 function normalizeLegacyInboundFrame(value: unknown): unknown {

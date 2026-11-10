@@ -6,7 +6,6 @@ import {
 } from "@t3tools/contracts";
 import type { ProviderInstance } from "@t3tools/provider-core/server/driver";
 import * as ProviderInstanceRegistry from "../provider/ProviderInstanceRegistry.ts";
-import { withProductionAllowlist } from "../provider/allowedModels.testkit.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as SourceControlProviderRegistry from "../sourceControl/SourceControlProviderRegistry.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -423,27 +422,6 @@ it.layer(layerCodexTextGenerationTest)("CodexTextGeneration", (it) => {
     ),
   );
 
-  // fork:model-allowlist
-  it.effect("keeps native helpers off after launch args that turn them on", () =>
-    withFakeCodexEnv(
-      {
-        output: JSON.stringify({ title: "Remove default shapes" }),
-        launchArgs: "--config agents.enabled=true --config features.multi_agent_v2=true",
-        requireArg:
-          "--config agents.enabled=false --config features.multi_agent_v2=false --output-schema",
-      },
-      (textGeneration) =>
-        Effect.gen(function* () {
-          const result = yield* textGeneration.generateThreadTitle({
-            cwd: process.cwd(),
-            message: "Remove default shapes from characters",
-            modelSelection: DEFAULT_TEST_MODEL_SELECTION,
-          });
-          expect(result.title).toBe("Remove default shapes");
-        }),
-    ),
-  );
-
   it.effect("passes exec-safe launch args into codex exec", () =>
     withFakeCodexEnv(
       {
@@ -673,118 +651,4 @@ it.effect.each(PREFLIGHT_PRIMARY_STATES)("text generation preflight: %s", (prima
           },
     ]);
   }),
-);
-
-// fork:model-allowlist
-const allowlistTitleService = (
-  instanceIds: ReadonlyArray<{ readonly id: string; readonly driver: string }>,
-  exhaustedId: string | null,
-) =>
-  Effect.gen(function* () {
-    const calls: ModelSelection[] = [];
-    const instances: ProviderInstance[] = instanceIds.map(({ id, driver: kind }) => {
-      const instanceId = ProviderInstanceId.make(id);
-      const driver = ProviderDriverKind.make(kind);
-      const snapshot: ServerProvider = {
-        instanceId,
-        driver,
-        enabled: true,
-        installed: true,
-        status: "ready",
-        auth: { status: "authenticated" },
-        version: null,
-        checkedAt: "1970-01-01T00:00:00Z",
-        models: [],
-        slashCommands: [],
-        skills: [],
-        ...(id === exhaustedId
-          ? {
-              usageLimits: {
-                checkedAt: "1970-01-01T00:00:00Z",
-                windows: [{ id: "session", kind: "session", label: "Session", usedPercent: 100 }],
-              },
-            }
-          : {}),
-      };
-      return {
-        instanceId,
-        driverKind: driver,
-        continuationIdentity: { driverKind: driver, continuationKey: id },
-        displayName: undefined,
-        enabled: true,
-        snapshot: { getSnapshot: Effect.succeed(snapshot) } as ProviderInstance["snapshot"],
-        orchestrationAdapter: {} as ProviderInstance["orchestrationAdapter"],
-        textGeneration: TextGeneration.TextGeneration.of({
-          generateCommitMessage: () => Effect.die("unused"),
-          generatePrContent: () => Effect.die("unused"),
-          generateBranchName: () => Effect.die("unused"),
-          generateReviewGuide: () => Effect.die("unused"),
-          generateTranscriptionPostProcessing: () => Effect.die("unused"),
-          generateThreadTitle: (input) =>
-            Effect.sync(() => {
-              calls.push(input.modelSelection);
-              return { title: "Generated title" };
-            }),
-        }),
-      };
-    });
-    const service = yield* TextGeneration.make.pipe(
-      Effect.provide(
-        Layer.mergeAll(
-          Layer.mock(ProviderInstanceRegistry.ProviderInstanceRegistry)({
-            listInstances: Effect.succeed(instances),
-            getInstance: (id) =>
-              Effect.succeed(instances.find((instance) => instance.instanceId === id)),
-          }),
-          ServerSettings.layerTest({
-            providerInstances: Object.fromEntries(
-              instanceIds.map(({ id, driver }) => [
-                id,
-                { driver: ProviderDriverKind.make(driver), config: {} },
-              ]),
-            ),
-          }),
-          Layer.mock(SourceControlProviderRegistry.SourceControlProviderRegistry)({
-            resolveLink: () => Effect.die("unused"),
-          }),
-        ),
-      ),
-    );
-    const title = (model: string) =>
-      service.generateThreadTitle({
-        cwd: "/tmp",
-        message: "hello",
-        linkedContext: "",
-        modelSelection: { instanceId: ProviderInstanceId.make(instanceIds[0]!.id), model },
-      });
-    return { calls, title };
-  });
-
-it.effect("a title job on a blocked model fails loudly instead of running it", () =>
-  Effect.gen(function* () {
-    const { calls, title } = yield* allowlistTitleService([{ id: "codex", driver: "codex" }], null);
-    const exit = yield* Effect.exit(title("gpt-6-luna"));
-    expect(Exit.isFailure(exit) && Cause.pretty(exit.cause)).toContain(
-      "Model not allowed: gpt-6-luna",
-    );
-    expect(calls).toEqual([]);
-  }).pipe(withProductionAllowlist),
-);
-
-it.effect("an exhausted title account falls back only to an allowed model", () =>
-  Effect.gen(function* () {
-    const { calls, title } = yield* allowlistTitleService(
-      [
-        { id: "codex", driver: "codex" },
-        { id: "opencode_work", driver: "opencode" },
-        { id: "codex_work", driver: "codex" },
-      ],
-      "codex",
-    );
-    yield* title("gpt-6.1-sol");
-    // OpenCode's default title model is blocked, so the second Codex account runs Sol.
-    expect(calls).toEqual([
-      { instanceId: ProviderInstanceId.make("codex_work"), model: "gpt-6.1-sol" },
-    ]);
-  }).pipe(withProductionAllowlist),
 );

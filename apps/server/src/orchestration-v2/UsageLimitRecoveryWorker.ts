@@ -10,7 +10,6 @@ import { forkParked } from "../serverActivation.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as Orchestrator from "./Orchestrator.ts";
-import * as QueuePromotionHold from "./QueuePromotionHold.ts";
 import * as ThreadManagement from "./ThreadManagementService.ts";
 
 const MAX_OVERDUE_ARM_MS = 24 * 60 * 60 * 1000;
@@ -93,8 +92,6 @@ const makeSweep = Effect.gen(function* () {
   const threads = yield* ThreadManagement.ThreadManagementService;
   const orchestrator = yield* Orchestrator.OrchestratorV2;
   const settings = yield* ServerSettings.ServerSettingsService;
-  // fork:model-allowlist: a resume cannot queue, so it stays armed and waits out the restart hold.
-  const promotionHold = yield* QueuePromotionHold.QueuePromotionHold;
   const due = DueHint.make();
   yield* forkParked(
     Stream.runForEach(orchestrator.streamDomainEvents, (event) =>
@@ -102,7 +99,6 @@ const makeSweep = Effect.gen(function* () {
     ),
   );
   yield* forkParked(Stream.runForEach(settings.streamChanges, () => due.invalidate));
-  yield* forkParked(Stream.runForEach(promotionHold.releases, () => due.invalidate));
   return Effect.fn("UsageLimitRecoveryWorker.sweep")(function* () {
     const now = yield* DateTime.now;
     const nowMs = DateTime.toEpochMillis(now);
@@ -115,7 +111,6 @@ const makeSweep = Effect.gen(function* () {
       snooze: preferences.snoozeLimitedThreads,
     });
     let acted = false;
-    const heldForRestart = (yield* promotionHold.phase) !== null;
     for (const thread of candidates) {
       const command = limitRecoveryCommand(
         thread,
@@ -124,7 +119,6 @@ const makeSweep = Effect.gen(function* () {
         preferences.snoozeLimitedThreads,
       );
       if (command === null) continue;
-      if (command.type === "message.dispatch" && heldForRestart) continue;
       acted = true;
       yield* Effect.gen(function* () {
         if (command.type === "thread.metadata.update" && command.limitRecovery != null) {

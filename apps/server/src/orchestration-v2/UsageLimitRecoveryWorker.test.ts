@@ -1,24 +1,16 @@
 import { assert, describe, it } from "@effect/vitest";
-import {
-  RunId,
-  ThreadId,
-  type OrchestrationV2ServerCommand,
-  type OrchestrationV2DomainEvent,
-} from "@t3tools/contracts";
+import { RunId, ThreadId, type OrchestrationV2DomainEvent } from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
-import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
-import * as Ref from "effect/Ref";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 
 import * as Scheduler from "../scheduling/Scheduler.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as Orchestrator from "./Orchestrator.ts";
-import * as QueuePromotionHold from "./QueuePromotionHold.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ThreadManagement from "./ThreadManagementService.ts";
 import * as UsageLimitRecoveryWorker from "./UsageLimitRecoveryWorker.ts";
@@ -49,11 +41,6 @@ it.effect("idle sweeps skip SQL until the next wake time or a relevant event", (
           Layer.mock(ThreadManagement.ThreadManagementService)({}),
           Layer.mock(Orchestrator.OrchestratorV2)({
             streamDomainEvents: Stream.fromQueue(events),
-          }),
-          // fork:model-allowlist
-          Layer.mock(QueuePromotionHold.QueuePromotionHold)({
-            phase: Effect.succeed(null),
-            releases: Stream.never,
           }),
           Layer.mock(ServerSettings.ServerSettingsService)({
             getSettings: Effect.succeed({
@@ -104,65 +91,6 @@ const failedThread = (failedAgoMs: number, resetAgoMs: number) => {
   };
   return candidate;
 };
-
-// fork:model-allowlist
-it.effect("keeps an auto-resume armed while promotion is held, and sends it on release", () =>
-  Effect.gen(function* () {
-    yield* TestClock.setTime(nowMs);
-    const phase = yield* Ref.make<QueuePromotionHold.QueuePromotionHoldPhase | null>("drain");
-    const releases = yield* Queue.unbounded<void>();
-    const dispatches = yield* Queue.unbounded<OrchestrationV2ServerCommand>();
-    const limited = failedThread(2 * HOUR_MS, HOUR_MS);
-    const armed: ProjectionStore.ProjectionLimitRecoveryCandidate = {
-      ...limited,
-      limitRecovery: {
-        runId: limited.latestRunId!,
-        resetAt: limited.usageLimitResetAt!,
-        autoResume: true,
-        snooze: false,
-      },
-    };
-    const layer = UsageLimitRecoveryWorker.layer.pipe(
-      Layer.provide(
-        Layer.mergeAll(
-          Scheduler.layer,
-          Layer.mock(ProjectionStore.ProjectionStoreV2)({
-            getLimitRecoveryCandidates: () => Effect.succeed([armed]),
-            getLimitRecoveryWakeAt: () => Effect.succeed(null),
-          }),
-          Layer.mock(ThreadManagement.ThreadManagementService)({
-            dispatch: (command) =>
-              Queue.offer(dispatches, command).pipe(Effect.as(undefined as never)),
-          }),
-          Layer.mock(Orchestrator.OrchestratorV2)({ streamDomainEvents: Stream.never }),
-          Layer.mock(QueuePromotionHold.QueuePromotionHold)({
-            phase: Ref.get(phase),
-            releases: Stream.fromQueue(releases),
-          }),
-          Layer.mock(ServerSettings.ServerSettingsService)({
-            getSettings: Effect.succeed({
-              autoResumeLimitedThreads: true,
-              snoozeLimitedThreads: false,
-            } as never),
-            streamChanges: Stream.never,
-          }),
-        ),
-      ),
-    );
-    yield* Effect.gen(function* () {
-      yield* TestClock.adjust("5 seconds");
-      assert.isTrue(Option.isNone(yield* Queue.poll(dispatches)));
-      yield* Ref.set(phase, null);
-      yield* Queue.offer(releases, undefined);
-      yield* TestClock.adjust("5 seconds");
-      const resume = yield* Queue.take(dispatches);
-      assert.equal(
-        resume.type === "message.dispatch" ? resume.usageLimitContinuationOfRunId : null,
-        limited.latestRunId,
-      );
-    }).pipe(Effect.provide(layer));
-  }),
-);
 
 describe("limitRecoveryCommand arming", () => {
   it("does not freshly arm a failure whose reset passed days ago", () => {

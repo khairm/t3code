@@ -1,7 +1,6 @@
 import {
   type ClaudeSettings,
   type ModelCapabilities,
-  ProviderDriverKind,
   type ServerProvider,
   type ServerProviderModel,
   type ServerProviderSlashCommand,
@@ -40,7 +39,6 @@ import {
   type ServerProviderDraft,
 } from "@t3tools/provider-core/server/snapshotProbe";
 import { resolveClaudeSdkExecutablePath } from "./Drivers/ClaudeExecutable.ts";
-import { filterAllowedModels, isModelAllowed } from "./allowedModels.ts";
 import { hasClaudeManagedMcpConfig, makeClaudeEnvironment } from "./Drivers/ClaudeHome.ts";
 import { discoverClaudeSkills, readClaudeSettingsEnv } from "./Drivers/ClaudeSkills.ts";
 import type { ProviderWorkspaceSnapshot } from "@t3tools/provider-core/server/driver";
@@ -64,16 +62,14 @@ const DEFAULT_CLAUDE_MODEL_CAPABILITIES: ModelCapabilities = createModelCapabili
   optionDescriptors: [],
 });
 
-// fork:model-allowlist
-const CLAUDE_DRIVER = ProviderDriverKind.make("claudeAgent");
-
 function claudeProviderModels(
   builtInModels: ReadonlyArray<ServerProviderModel>,
   customModels: ClaudeSettings["customModels"],
 ): ReadonlyArray<ServerProviderModel> {
-  return filterAllowedModels(
-    providerModelsFromSettings(builtInModels, customModels, DEFAULT_CLAUDE_MODEL_CAPABILITIES),
-    CLAUDE_DRIVER,
+  return providerModelsFromSettings(
+    builtInModels,
+    customModels,
+    DEFAULT_CLAUDE_MODEL_CAPABILITIES,
   ).map((model) =>
     model.isCustom ? { ...model, capabilities: withUltracodeToggle(model.capabilities) } : model,
   );
@@ -622,12 +618,8 @@ export const checkClaudeProviderStatus = Effect.fn("checkClaudeProviderStatus")(
     });
   }
 
-  // fork:model-allowlist: no upgrade prompt for a blocked model.
-  const allowedCatalog = {
-    models: modelCatalog.models.filter((entry) => isModelAllowed(entry.model.slug, CLAUDE_DRIVER)),
-  };
-  const updateRequiredModels = resolveClaudeUpdateRequiredModels(allowedCatalog, parsedVersion);
-  const versionUpgradeMessage = formatClaudeVersionUpgradeMessage(allowedCatalog, parsedVersion);
+  const updateRequiredModels = resolveClaudeUpdateRequiredModels(modelCatalog, parsedVersion);
+  const versionUpgradeMessage = formatClaudeVersionUpgradeMessage(modelCatalog, parsedVersion);
 
   const probeResult = resolveCapabilities
     ? yield* resolveCapabilities(claudeSettings).pipe(Effect.result)
