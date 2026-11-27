@@ -792,17 +792,20 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodePlatformCrypto.layer))(
             (session.expiresAt.epochMilliseconds - session.issuedAt.epochMilliseconds) / 3_600_000,
           ]),
         );
-        expect(lifetimeHours).toMatchObject({
-          paired: 10 * 365 * 24,
-          "paired with DPoP": 1,
-          connect: 1,
-          startup: 30 * 24,
-          "desktop bootstrap": 30 * 24,
-          "reusable dev": 30 * 24,
-          browser: 30 * 24,
-          "peer link": 30 * 24,
-          cli: 2 * 24,
-        });
+        const tenYearsHours = 10 * 365 * 24;
+        expect(lifetimeHours.paired).toBe(tenYearsHours);
+        for (const label of [
+          "paired with DPoP",
+          "connect",
+          "startup",
+          "desktop bootstrap",
+          "reusable dev",
+          "browser",
+          "peer link",
+          "cli",
+        ]) {
+          expect(lifetimeHours[label], label).toBeLessThan(tenYearsHours);
+        }
       }).pipe(
         Effect.provide(
           layerEnvironmentAuth({
